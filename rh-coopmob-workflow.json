@@ -1,0 +1,232 @@
+{
+  "name": "RH CoopMob - Processo Seletivo Entregadores",
+  "nodes": [
+    {
+      "name": "Webhook Twilio WhatsApp",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [100,100],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-inbound",
+        "responseMode": "onReceived"
+      }
+    },
+    {
+      "name": "Extrair Dados da Mensagem",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [300,100],
+      "parameters": {
+        "values": {
+          "string": [
+            { "name": "chatId",    "value": "={{ $json[\"body\"][\"From\"] }}" },
+            { "name": "messageText","value": "={{ $json[\"body\"][\"Body\"] }}" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "É Mensagem Válida?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [500,100],
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{ $json[\"messageText\"] }}", "operation": "notEmpty" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Memória de Chat",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [700,100],
+      "parameters": {
+        "operation": "get",
+        "key": "={{ $json[\"chatId\"] }}"
+      },
+      "credentials": {
+        "redis": "YOUR_REDIS_CREDENTIAL_ID"
+      }
+    },
+    {
+      "name": "Modelo Gemini",
+      "type": "n8n-nodes-base.ai",
+      "typeVersion": 1,
+      "position": [900,100],
+      "parameters": {
+        "model": "models/gemini-2.0-flash",
+        "temperature": 0.4,
+        "messages": [
+          { "role": "system", "content": "Você é a Kelly, assistente virtual de RH da CoopMob. Ao receber uma mensagem, produza um JSON com todos os atributos que precisa (nome, filhos, escolaridade, turnos, experiencia_meses, dispositivo, cidade). Não faça consultas à planilha—isso será via n8n." },
+          { "role": "user",   "content": "={{ $json[\"messageText\"] }}" }
+        ]
+      },
+      "credentials": {
+        "ai": "YOUR_GEMINI_CREDENTIAL_ID"
+      }
+    },
+    {
+      "name": "Salvar Memória",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1100,100],
+      "parameters": {
+        "operation": "set",
+        "key": "={{ $json[\"chatId\"] }}",
+        "value": "={{ $node[\"Modelo Gemini\"].json[\"response\"] }}",
+        "expire": 86400
+      },
+      "credentials": {
+        "redis": "YOUR_REDIS_CREDENTIAL_ID"
+      }
+    },
+    {
+      "name": "Parse AI Agent Output",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1300,100],
+      "parameters": {
+        "functionCode": "const data = JSON.parse(items[0].json.response); return [{ json: data }];"
+      }
+    },
+    {
+      "name": "Cidade Coletada?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1500,100],
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{ $json[\"cidade\"] }}", "operation": "notEmpty" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Google Sheets - Consultar Vagas",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [1700,100],
+      "parameters": {
+        "operation": "lookupRows",
+        "sheetId": "YOUR_SPREADSHEET_ID",
+        "sheetName": "Vagas",
+        "lookupColumn": "CIDADE",
+        "lookupValue": "={{ $json[\"cidade\"] }}",
+        "options": {
+          "filters": [
+            { "column": "STATUS", "value": "ATIVA" },
+            { "column": "VAGAS RESTANTES", "condition": ">", "value": "0" }
+          ],
+          "limit": 1
+        }
+      },
+      "credentials": {
+        "googleSheets": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID"
+      }
+    },
+    {
+      "name": "Vagas Encontradas?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1900,100],
+      "parameters": {
+        "conditions": {
+          "number": [
+            { "value1": "={{ $node[\"Google Sheets - Consultar Vagas\"].json.length }}", "operation": "greater", "value2": 0 }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Formatar Proposta",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [2100,60],
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "responseMessage",
+              "value": "={{`Perfeito, ${$json.nome}! Na farmácia ${$node[\"Google Sheets - Consultar Vagas\"].json[0][\"FARMÁCIA\"]} em ${$json.cidade}, turno ${$node[\"Google Sheets - Consultar Vagas\"].json[0][\"TURNO\"]}:\n• Taxa de entrega: R$ ${$node[\"Google Sheets - Consultar Vagas\"].json[0][\"TAXA DE ENTREGA\"]}\n• Matrícula: R$ 500 (à vista ou em até 25× R$ 20)\n• Bag: R$ 180 + frete (até 2×)\n• Uniforme: R$ 47 + frete (até 2×)\nDeseja prosseguir com a matrícula agora? (sim/não)`}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Mensagem Sem Vagas",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [2100,140],
+      "parameters": {
+        "values": {
+          "string": [
+            {
+              "name": "responseMessage",
+              "value": "Não há vagas disponíveis em {{$json.cidade}} no momento. Obrigado pelo seu interesse."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Tratar Resposta Pós-Proposta",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2300,100],
+      "parameters": {
+        "functionCode": "const txt = items[0].json.messageText.toLowerCase(); if(txt==='sim'){ return [{json:{responseMessage:'Aqui está o link de matrícula: https://app.pipefy.com/public/form/v2m7kpB-'}}]; } if(txt==='não'){ return [{json:{responseMessage:'Tudo bem. Se tiver dúvidas, estou à disposição.'}}]; } return [{json:{responseMessage: items[0].json.responseMessage}}];"
+      }
+    },
+    {
+      "name": "Enviar Resposta WhatsApp",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [2500,100],
+      "parameters": {
+        "operation": "sendMessage",
+        "to": "={{ $json["chatId"] }}",
+        "from": "YOUR_TWILIO_WHATSAPP_NUMBER",
+        "body": "={{ $json["responseMessage"] }}"
+      },
+      "credentials": {
+        "twilioApi": "YOUR_TWILIO_CREDENTIAL_ID"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Twilio WhatsApp": { "main": [[{"node":"Extrair Dados da Mensagem"}]] },
+    "Extrair Dados da Mensagem": { "main": [[{"node":"É Mensagem Válida?"}]] },
+    "É Mensagem Válida?": {
+      "main": [
+        [{"node":"Memória de Chat"}],
+        [{"node":"Enviar Resposta WhatsApp","type":"main","index":1}]
+      ]
+    },
+    "Memória de Chat": { "main": [[{"node":"Modelo Gemini"}]] },
+    "Modelo Gemini": { "main": [[{"node":"Salvar Memória"}]] },
+    "Salvar Memória": { "main": [[{"node":"Parse AI Agent Output"}]] },
+    "Parse AI Agent Output": { "main": [[{"node":"Cidade Coletada?"}]] },
+    "Cidade Coletada?": {
+      "main": [
+        [{"node":"Google Sheets - Consultar Vagas"}],
+        [{"node":"Extrair Dados da Mensagem","type":"main","index":1}]
+      ]
+    },
+    "Google Sheets - Consultar Vagas": { "main": [[{"node":"Vagas Encontradas?"}]] },
+    "Vagas Encontradas?": {
+      "main": [
+        [{"node":"Formatar Proposta"}],
+        [{"node":"Mensagem Sem Vagas"}]
+      ]
+    },
+    "Formatar Proposta": { "main": [[{"node":"Tratar Resposta Pós-Proposta"}]] },
+    "Mensagem Sem Vagas": { "main": [[{"node":"Enviar Resposta WhatsApp"}]] },
+    "Tratar Resposta Pós-Proposta": { "main":[[{"node":"Enviar Resposta WhatsApp"}]] }
+  }
+}
