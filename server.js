@@ -105,13 +105,38 @@ app.post('/cx', async (req, res) => {
 
     const { rows } = await (tag==='verificar_cidade' || tag==='listar_vagas' ? getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`) : { rows:[] });
 
-    if (tag === 'verificar_cidade') {
-      const cidade = params.cidade || params['sys.geo-city'] || '';
-      const abertas = rows.filter(r => eqCity(r.CIDADE, cidade) && String(r.STATUS||'').toLowerCase()==='aberto');
-      const vagas_abertas = abertas.length>0;
-      session_params = { vagas_abertas, cidade };
-      messages = vagas_abertas ? [t(`Ótimo! Temos vagas em ${cidade}.`)] : [t(`No momento não há vagas em ${cidade}.`)];
-    }
+ if (tag === 'verificar_cidade') {
+  // aceita @sys.geo-city (string) ou @sys.location (objeto) e ignora placeholder
+  const raw =
+    params.cidade ||
+    params['sys.geo-city'] ||
+    params['sys.location'] ||
+    params.location || '';
+
+  const cidade = (typeof raw === 'object')
+    ? (raw.city || raw['admin-area'] || raw.original || '')
+    : String(raw);
+
+  // personalização pelo nome vindo do WhatsApp (via middleware)
+  const nome = (params.nome || '').toString().trim();
+  const firstName = nome ? nome.split(' ')[0] : '';
+  const prefixo = firstName ? `${firstName}, ` : '';
+
+  if (!cidade || cidade.toLowerCase() === 'geo-city') {
+    session_params = { vagas_abertas: false };
+    messages = [ t(`${prefixo}não entendi a cidade. Pode informar de novo?`) ];
+  } else {
+    const abertas = rows.filter(r =>
+      eqCity(r.CIDADE, cidade) && String(r.STATUS || '').toLowerCase() === 'aberto'
+    );
+    const vagas_abertas = abertas.length > 0;
+    session_params = { vagas_abertas, cidade };
+    messages = vagas_abertas
+      ? [ t(`Ótimo! ${prefixo}temos vagas em ${cidade}.`) ]
+      : [ t(`Poxa… ${prefixo}no momento não há vagas em ${cidade}.`) ];
+  }
+}
+
 
     else if (tag === 'analisar_perfil') {
       const { q1,q2,q3,q4,q5 } = params;
