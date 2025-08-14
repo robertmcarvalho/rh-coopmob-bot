@@ -25,7 +25,7 @@ const {
 const app = express();
 app.use(bodyParser.json());
 
-// ---- Google Sheets Auth ----
+// ---- Google Sheets Auth (ADC no Cloud Run) ----
 const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
 async function sheetsClient() {
   const auth = new google.auth.GoogleAuth({ scopes: SCOPES });
@@ -34,20 +34,21 @@ async function sheetsClient() {
 }
 
 // ---- Helpers ----
-const t = msg => ({ text: { text: [msg] } });
-const payload = obj => ({ payload: obj });
+const t = (msg) => ({ text: { text: [msg] } });
+const payload = (obj) => ({ payload: obj });
 const nowISO = () => new Date().toISOString();
-const unaccent = (s='') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-const eqCity = (a,b) => unaccent(String(a)).toUpperCase().trim() === unaccent(String(b)).toUpperCase().trim();
+const unaccent = (s = '') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+const eqCity = (a, b) =>
+  unaccent(String(a)).toUpperCase().trim() === unaccent(String(b)).toUpperCase().trim();
 
 function scorePerfil({ q1, q2, q3, q4, q5 }) {
   let s = 0;
-  if (/decid|rápid|rapido/i.test(q1||'')) s++;
-  if (/ausent|cliente|atualiz|sistema|5 ?min/i.test(q2||'')) s++;
-  if (/l[ií]der|supervisor|coord/i.test(q3||'')) s++;
-  if (/registr|nota|inform|farm/i.test(q4||'')) s++;
-  if (/comunic|anteced|tr[aâ]nsit|chuva|prioriz/i.test(q5||'')) s++;
-  return { aprovado: s>=4, nota:s, resumo:`Q1..Q5 OK em ${s}/5` };
+  if (/decid|rápid|rapido/i.test(q1 || '')) s++;
+  if (/ausent|cliente|atualiz|sistema|5 ?min/i.test(q2 || '')) s++;
+  if (/l[ií]der|supervisor|coord/i.test(q3 || '')) s++;
+  if (/registr|nota|inform|farm/i.test(q4 || '')) s++;
+  if (/comunic|anteced|tr[aâ]nsit|chuva|prioriz/i.test(q5 || '')) s++;
+  return { aprovado: s >= 4, nota: s, resumo: `Q1..Q5 OK em ${s}/5` };
 }
 
 async function getRows(spreadsheetId, rangeA1) {
@@ -56,8 +57,9 @@ async function getRows(spreadsheetId, rangeA1) {
   const values = res.data.values || [];
   if (!values.length) return { header: [], rows: [] };
   const header = values[0];
-  const rows = values.slice(1).map(r => {
-    const o = {}; header.forEach((h,i)=>o[h]=r[i]);
+  const rows = values.slice(1).map((r) => {
+    const o = {};
+    header.forEach((h, i) => (o[h] = r[i]));
     return o;
   });
   return { header, rows };
@@ -65,17 +67,23 @@ async function getRows(spreadsheetId, rangeA1) {
 async function appendRow(spreadsheetId, rangeA1, rowArray) {
   const sheets = await sheetsClient();
   await sheets.spreadsheets.values.append({
-    spreadsheetId, range: rangeA1,
-    valueInputOption:'USER_ENTERED', insertDataOption:'INSERT_ROWS',
-    requestBody:{ values:[rowArray] }
+    spreadsheetId,
+    range: rangeA1,
+    valueInputOption: 'USER_ENTERED',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [rowArray] }
   });
 }
 
 // ---- Vacancy helpers ----
 function serializeVagas(list) {
-  return list.map(v => ({
-    VAGA_ID: v.VAGA_ID, CIDADE: v.CIDADE, FARMACIA: v.FARMACIA,
-    TAXA_ENTREGA: v.TAXA_ENTREGA, TURNO: v.TURNO, STATUS: v.STATUS
+  return list.map((v) => ({
+    VAGA_ID: v.VAGA_ID,
+    CIDADE: v.CIDADE,
+    FARMACIA: v.FARMACIA,
+    TAXA_ENTREGA: v.TAXA_ENTREGA,
+    TURNO: v.TURNO,
+    STATUS: v.STATUS
   }));
 }
 function vagaToLine(v) {
@@ -85,11 +93,18 @@ function vagaToLine(v) {
 }
 function browseMessage(v, idx, total) {
   return [
-    t(`Opção ${idx+1}/${total}: ${vagaToLine(v)}`),
-    payload({ type:'choices', choices:[
-      { id:`select:${v.VAGA_ID}`, title:`Quero essa (ID ${v.VAGA_ID})`, data:{ action:'select', vaga_id:String(v.VAGA_ID)} },
-      { id:`next`, title:'Próxima', data:{ action:'next' } }
-    ]}),
+    t(`Opção ${idx + 1}/${total}: ${vagaToLine(v)}`),
+    payload({
+      type: 'choices',
+      choices: [
+        {
+          id: `select:${v.VAGA_ID}`,
+          title: `Quero essa (ID ${v.VAGA_ID})`,
+          data: { action: 'select', vaga_id: String(v.VAGA_ID) }
+        },
+        { id: `next`, title: 'Próxima', data: { action: 'next' } }
+      ]
+    }),
     t(`Responda "quero ${v.VAGA_ID}" para escolher, ou "próxima" para ver outra.`)
   ];
 }
@@ -103,64 +118,75 @@ app.post('/cx', async (req, res) => {
     let session_params = {};
     let messages = [];
 
-    const { rows } = await (tag==='verificar_cidade' || tag==='listar_vagas' ? getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`) : { rows:[] });
+    const { rows } = await (tag === 'verificar_cidade' || tag === 'listar_vagas'
+      ? getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`)
+      : { rows: [] });
 
- if (tag === 'verificar_cidade') {
-  // aceita @sys.geo-city (string) ou @sys.location (objeto) e ignora placeholder
-  const raw =
-    params.cidade ||
-    params['sys.geo-city'] ||
-    params['sys.location'] ||
-    params.location || '';
+    if (tag === 'verificar_cidade') {
+      // aceita @sys.geo-city (string) ou @sys.location (objeto) e ignora placeholder
+      const raw =
+        params.cidade ||
+        params['sys.geo-city'] ||
+        params['sys.location'] ||
+        params.location ||
+        '';
 
-  const cidade = (typeof raw === 'object')
-    ? (raw.city || raw['admin-area'] || raw.original || '')
-    : String(raw);
+      const cidade =
+        typeof raw === 'object'
+          ? raw.city || raw['admin-area'] || raw.original || ''
+          : String(raw);
 
-  // personalização pelo nome vindo do WhatsApp (via middleware)
-  const nome = (params.nome || '').toString().trim();
-  const firstName = nome ? nome.split(' ')[0] : '';
-  const prefixo = firstName ? `${firstName}, ` : '';
+      // nome do WhatsApp (primeiro nome)
+      const nome = (params.nome || '').toString().trim();
+      const firstName = nome ? nome.split(' ')[0] : '';
+      const prefixo = firstName ? `${firstName}, ` : '';
 
-  if (!cidade || cidade.toLowerCase() === 'geo-city') {
-    session_params = { vagas_abertas: false };
-    messages = [ t(`${prefixo}não entendi a cidade. Pode informar de novo?`) ];
-  } else {
-    const abertas = rows.filter(r =>
-      eqCity(r.CIDADE, cidade) && String(r.STATUS || '').toLowerCase() === 'aberto'
-    );
-    const vagas_abertas = abertas.length > 0;
-    session_params = { vagas_abertas, cidade };
-    messages = vagas_abertas
-      ? [ t(`Ótimo! ${prefixo}temos vagas em ${cidade}.`) ]
-      : [ t(`Poxa… ${prefixo}no momento não há vagas em ${cidade}.`) ];
-  }
-}
+      // bolha 1: sempre avisa que vai verificar (personalizada)
+      const bolhaBusca = t(
+        `Obrigado${firstName ? `, ${firstName}` : ''}! Vou verificar vagas na sua cidade…`
+      );
 
-
-    else if (tag === 'analisar_perfil') {
-      const { q1,q2,q3,q4,q5 } = params;
-      const r = scorePerfil({ q1,q2,q3,q4,q5 });
-      session_params = { perfil_aprovado:r.aprovado, perfil_nota:r.nota, perfil_resumo:r.resumo };
+      if (!cidade || cidade.toLowerCase() === 'geo-city') {
+        session_params = { vagas_abertas: false };
+        messages = [bolhaBusca, t(`${prefixo}não entendi a cidade. Pode informar de novo?`)];
+      } else {
+        const abertas = rows.filter(
+          (r) => eqCity(r.CIDADE, cidade) && String(r.STATUS || '').toLowerCase() === 'aberto'
+        );
+        const vagas_abertas = abertas.length > 0;
+        session_params = { vagas_abertas, cidade };
+        messages = [
+          bolhaBusca,
+          vagas_abertas
+            ? t(`Ótimo! ${prefixo}temos vagas em ${cidade}.`)
+            : t(`Poxa… ${prefixo}no momento não há vagas em ${cidade}.`)
+        ];
+      }
+    } else if (tag === 'analisar_perfil') {
+      const { q1, q2, q3, q4, q5 } = params;
+      const r = scorePerfil({ q1, q2, q3, q4, q5 });
+      session_params = {
+        perfil_aprovado: r.aprovado,
+        perfil_nota: r.nota,
+        perfil_resumo: r.resumo
+      };
       messages = [t(`Perfil: ${r.aprovado ? 'Aprovado' : 'Em avaliação/Reprovado'} (nota ${r.nota}/5).`)];
-    }
-
-    else if (tag === 'listar_vagas') {
+    } else if (tag === 'listar_vagas') {
       const cidade = params.cidade || '';
-      const candidatas = rows.filter(r => eqCity(r.CIDADE, cidade) && String(r.STATUS||'').toLowerCase()==='aberto');
+      const candidatas = rows.filter(
+        (r) => eqCity(r.CIDADE, cidade) && String(r.STATUS || '').toLowerCase() === 'aberto'
+      );
       const total = candidatas.length;
       if (!total) {
-        session_params = { listado:true, vagas_lista:[], vagas_idx:0, vagas_total:0 };
+        session_params = { listado: true, vagas_lista: [], vagas_idx: 0, vagas_total: 0 };
         messages = [t('Não encontrei vagas abertas neste momento.')];
       } else {
         const lista = serializeVagas(candidatas);
         const idx = 0;
-        session_params = { listado:true, vagas_lista:lista, vagas_idx:idx, vagas_total:total };
+        session_params = { listado: true, vagas_lista: lista, vagas_idx: idx, vagas_total: total };
         messages = browseMessage(lista[idx], idx, total);
       }
-    }
-
-    else if (tag === 'navegar_vagas') {
+    } else if (tag === 'navegar_vagas') {
       const lista = params.vagas_lista || [];
       let idx = Number(params.vagas_idx || 0);
       const total = Number(params.vagas_total || lista.length || 0);
@@ -171,46 +197,83 @@ app.post('/cx', async (req, res) => {
         session_params = { vagas_idx: idx };
         messages = browseMessage(lista[idx], idx, total);
       }
-    }
-
-    else if (tag === 'selecionar_vaga') {
+    } else if (tag === 'selecionar_vaga') {
       const lista = params.vagas_lista || [];
       const vagaId = (params.vaga_id || params.VAGA_ID || '').toString().trim();
-      const v = lista.find(x => String(x.VAGA_ID).trim() === vagaId);
+      const v = lista.find((x) => String(x.VAGA_ID).trim() === vagaId);
       if (!v) {
         messages = [t(`Não encontrei a vaga ID ${vagaId} nas opções.`)];
       } else {
         session_params = {
-          vaga_id: v.VAGA_ID, vaga_farmacia: v.FARMACIA,
-          vaga_turno: v.TURNO, vaga_taxa: Number(v.TAXA_ENTREGA||0)
+          vaga_id: v.VAGA_ID,
+          vaga_farmacia: v.FARMACIA,
+          vaga_turno: v.TURNO,
+          vaga_taxa: Number(v.TAXA_ENTREGA || 0)
         };
-        messages = [ t(`Perfeito! Você escolheu: ${vagaToLine(v)}.`),
-                     t('Vou registrar seus dados e te enviar o link de inscrição.') ];
+        messages = [
+          t(`Perfeito! Você escolheu: ${vagaToLine(v)}.`),
+          t('Vou registrar seus dados e te enviar o link de inscrição.')
+        ];
       }
-    }
+    } else if (tag === 'salvar_lead') {
+      const {
+        nome,
+        telefone,
+        cidade,
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+        perfil_aprovado,
+        perfil_nota,
+        perfil_resumo,
+        vaga_id,
+        vaga_farmacia,
+        vaga_turno,
+        vaga_taxa
+      } = params;
 
-    else if (tag === 'salvar_lead') {
-      const { nome, telefone, cidade, q1,q2,q3,q4,q5,
-              perfil_aprovado, perfil_nota, perfil_resumo,
-              vaga_id, vaga_farmacia, vaga_turno, vaga_taxa } = params;
       const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
-      const taxaStr = (vaga_taxa!==undefined && vaga_taxa!==null && !Number.isNaN(Number(vaga_taxa)))
-        ? Number(vaga_taxa).toFixed(2) : (vaga_taxa || '');
-      const linha = [ nowISO(), nome||'', telefone||'', cidade||'',
-        q1||'',q2||'',q3||'',q4||'',q5||'',
-        (perfil_aprovado ? 'Aprovado' : 'Reprovado'),
-        (perfil_nota ?? ''), (perfil_resumo ?? ''),
-        vaga_id||'', vaga_farmacia||'', vaga_turno||'', taxaStr, protocolo
+      const taxaStr =
+        vaga_taxa !== undefined && vaga_taxa !== null && !Number.isNaN(Number(vaga_taxa))
+          ? Number(vaga_taxa).toFixed(2)
+          : vaga_taxa || '';
+
+      const linha = [
+        nowISO(),
+        nome || '',
+        telefone || '',
+        cidade || '',
+        q1 || '',
+        q2 || '',
+        q3 || '',
+        q4 || '',
+        q5 || '',
+        perfil_aprovado ? 'Aprovado' : 'Reprovado',
+        perfil_nota ?? '',
+        perfil_resumo ?? '',
+        vaga_id || '',
+        vaga_farmacia || '',
+        vaga_turno || '',
+        taxaStr,
+        protocolo
       ];
       await appendRow(SHEETS_LEADS_ID, `${SHEETS_LEADS_TAB}!A1:Z1`, linha);
       session_params = { protocolo, pipefy_link: PIPEFY_LINK };
-      messages = [ t(`Cadastro concluído! Protocolo: ${protocolo}`), t(`Finalize sua inscrição: ${PIPEFY_LINK}`) ];
+      messages = [
+        t(`Cadastro concluído! Protocolo: ${protocolo}`),
+        t(`Finalize sua inscrição: ${PIPEFY_LINK}`)
+      ];
     }
 
-    res.json({ fulfillment_response:{ messages }, session_info:{ parameters:{ ...params, ...session_params } } });
+    res.json({
+      fulfillment_response: { messages },
+      session_info: { parameters: { ...params, ...session_params } }
+    });
   } catch (e) {
     console.error(e?.response?.data || e);
-    res.json({ fulfillment_response:{ messages:[t('Erro interno no webhook.')] } });
+    res.json({ fulfillment_response: { messages: [t('Erro interno no webhook.')] } });
   }
 });
 
@@ -218,24 +281,86 @@ app.post('/cx', async (req, res) => {
 const WA_BASE = 'https://graph.facebook.com/v20.0';
 
 async function waSendText(to, text) {
-  return axios.post(`${WA_BASE}/${WA_PHONE_ID}/messages`, {
-    messaging_product:'whatsapp', to, type:'text', text:{ body:text }
-  }, { headers:{ Authorization:`Bearer ${WA_TOKEN}` } });
+  return axios.post(
+    `${WA_BASE}/${WA_PHONE_ID}/messages`,
+    { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
+    { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
+  );
 }
 async function waSendButtons(to, bodyText, buttons) {
-  const actionButtons = buttons.slice(0,3).map(b => ({
-    type:'reply', reply:{ id:b.id, title: (b.title||'Opção').slice(0,20) }
+  const actionButtons = buttons.slice(0, 3).map((b) => ({
+    type: 'reply',
+    reply: { id: b.id, title: (b.title || 'Opção').slice(0, 20) }
   }));
-  return axios.post(`${WA_BASE}/${WA_PHONE_ID}/messages`, {
-    messaging_product:'whatsapp', to, type:'interactive',
-    interactive:{ type:'button', body:{ text: bodyText.slice(0,1024) }, action:{ buttons: actionButtons } }
-  }, { headers:{ Authorization:`Bearer ${WA_TOKEN}` } });
+  return axios.post(
+    `${WA_BASE}/${WA_PHONE_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'interactive',
+      interactive: {
+        type: 'button',
+        body: { text: bodyText.slice(0, 1024) },
+        action: { buttons: actionButtons }
+      }
+    },
+    { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
+  );
 }
 
-// CX Sessions
-const cxClient = new SessionsClient();
+// util: pequena pausa entre envios
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// util: divide um texto em parágrafos/bloquinhos (duas quebras de linha = novo bloco)
+function splitIntoSegments(text) {
+  if (!text) return [];
+  const rough = String(text)
+    .split(/\n{2,}/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const maxLen = 900;
+  const segments = [];
+  for (const part of rough) {
+    if (part.length <= maxLen) {
+      segments.push(part);
+    } else {
+      const lines = part.split('\n');
+      let acc = '';
+      for (const ln of lines) {
+        if ((acc + (acc ? '\n' : '') + ln).length > maxLen) {
+          if (acc) segments.push(acc);
+          acc = ln;
+        } else {
+          acc = acc ? acc + '\n' + ln : ln;
+        }
+      }
+      if (acc) segments.push(acc);
+    }
+  }
+  return segments;
+}
+
+// envia um "Agent response" em várias bolhas, com pacing
+async function waSendBurst(to, rawText, delayMs = 450) {
+  const segments = splitIntoSegments(rawText);
+  if (!segments.length) return;
+  for (const seg of segments) {
+    await waSendText(to, seg);
+    await sleep(delayMs);
+  }
+}
+
+// ---- CX Sessions (endpoint regional) ----
+const DFCX_ENDPOINT = `${CX_LOCATION}-dialogflow.googleapis.com`;
+const cxClient = new SessionsClient({ apiEndpoint: DFCX_ENDPOINT });
+
 function sessionPath(waId) {
-  return cxClient.projectLocationAgentSessionPath(GCLOUD_PROJECT, CX_LOCATION, CX_AGENT_ID, waId);
+  return cxClient.projectLocationAgentSessionPath(
+    GCLOUD_PROJECT,
+    CX_LOCATION,
+    CX_AGENT_ID,
+    waId
+  );
 }
 async function cxDetectText(waId, text, params = {}) {
   const request = {
@@ -249,9 +374,13 @@ async function cxDetectText(waId, text, params = {}) {
 
 // Helpers payload
 function isChoicesPayload(m) {
-  return m && m.payload && (
-    (m.payload.fields && m.payload.fields.type && m.payload.fields.type.stringValue === 'choices') ||
-    (m.payload.type === 'choices')
+  return (
+    m &&
+    m.payload &&
+    ((m.payload.fields &&
+      m.payload.fields.type &&
+      m.payload.fields.type.stringValue === 'choices') ||
+      m.payload.type === 'choices')
   );
 }
 function decodePayload(m) {
@@ -260,32 +389,36 @@ function decodePayload(m) {
   } catch {}
   return m.payload || {};
 }
-function buttonsFromChoices(choices=[]) {
-  return choices.slice(0,3).map(ch => {
+function buttonsFromChoices(choices = []) {
+  return choices.slice(0, 3).map((ch) => {
     const data = ch.data || {};
     let id = ch.id || '';
-    if (!id && data.action) id = data.action === 'select' && data.vaga_id ? `select:${data.vaga_id}` : data.action;
+    if (!id && data.action)
+      id = data.action === 'select' && data.vaga_id ? `select:${data.vaga_id}` : data.action;
     const title = ch.title || (data.action === 'next' ? 'Próxima' : `Quero ${data.vaga_id || ''}`);
     return { id, title };
   });
 }
 function parseButtonId(id) {
-  if (!id) return { action:'unknown' };
+  if (!id) return { action: 'unknown' };
   const [action, rest] = id.split(':');
-  if (action === 'select') return { action, vaga_id:(rest||'').trim() };
+  if (action === 'select') return { action, vaga_id: (rest || '').trim() };
   if (action === 'next') return { action };
-  try { return JSON.parse(id); } catch {}
-  return { action:id };
+  try {
+    return JSON.parse(id);
+  } catch {}
+  return { action: id };
 }
 
-// Verify endpoint
-app.get('/wa/webhook', (req,res) => {
-  const { ['hub.mode']:mode, ['hub.verify_token']:token, ['hub.challenge']:challenge } = req.query;
+// Verify endpoint (WhatsApp)
+app.get('/wa/webhook', (req, res) => {
+  const { ['hub.mode']: mode, ['hub.verify_token']: token, ['hub.challenge']: challenge } =
+    req.query;
   if (mode === 'subscribe' && token === WA_VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// Receive messages
+// Receive messages (WhatsApp → CX → WhatsApp)
 app.post('/wa/webhook', async (req, res) => {
   try {
     const entry = req.body.entry?.[0];
@@ -298,7 +431,7 @@ app.post('/wa/webhook', async (req, res) => {
       const from = msg.from;
       const profileName = contacts?.[0]?.profile?.name;
       let userText = null;
-      let extraParams = { nome: profileName, telefone: from };
+      const extraParams = { nome: profileName, telefone: from };
 
       if (msg.type === 'text') {
         userText = msg.text?.body?.trim();
@@ -307,13 +440,17 @@ app.post('/wa/webhook', async (req, res) => {
           const id = msg.interactive.button_reply?.id;
           const parsed = parseButtonId(id);
           if (parsed.action === 'next') userText = 'próxima';
-          else if (parsed.action === 'select') { userText = `quero ${parsed.vaga_id}`; extraParams.vaga_id = parsed.vaga_id; }
-          else userText = parsed.action;
+          else if (parsed.action === 'select') {
+            userText = `quero ${parsed.vaga_id}`;
+            extraParams.vaga_id = parsed.vaga_id;
+          } else userText = parsed.action;
         } else if (msg.interactive.type === 'list_reply') {
           const id = msg.interactive.list_reply?.id;
           const parsed = parseButtonId(id);
-          if (parsed.action === 'select') { userText = `quero ${parsed.vaga_id}`; extraParams.vaga_id = parsed.vaga_id; }
-          else userText = 'próxima';
+          if (parsed.action === 'select') {
+            userText = `quero ${parsed.vaga_id}`;
+            extraParams.vaga_id = parsed.vaga_id;
+          } else userText = 'próxima';
         }
       } else {
         userText = '[anexo recebido]';
@@ -322,17 +459,22 @@ app.post('/wa/webhook', async (req, res) => {
       // Dialogflow CX
       const cxResp = await cxDetectText(from, userText, extraParams);
       const outputs = cxResp.queryResult?.responseMessages || [];
+
       for (const m of outputs) {
         if (isChoicesPayload(m)) {
           const decoded = decodePayload(m);
-          const label = 'Escolha uma opção:';
-          await waSendButtons(from, label, buttonsFromChoices(decoded.choices || []));
+          await waSendButtons(from, 'Escolha uma opção:', buttonsFromChoices(decoded.choices || []));
           continue;
         }
         if (m.text && Array.isArray(m.text.text)) {
-          for (const line of m.text.text) if (line && line.trim()) await waSendText(from, line);
+          for (const raw of m.text.text) {
+            const line = (raw || '').trim();
+            if (!line) continue;
+            await waSendBurst(from, line, 450); // bolhas separadas + pacing
+          }
           continue;
         }
+        // fallback
         await waSendText(from, '[mensagem recebida]');
       }
     }
@@ -343,4 +485,8 @@ app.post('/wa/webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Kelly combined on :${PORT} (/cx, /wa/webhook)`));
+app.listen(PORT, () =>
+  console.log(
+    `Kelly combined on :${PORT} (/cx, /wa/webhook) — CX endpoint: ${CX_LOCATION}-dialogflow.googleapis.com`
+  )
+);
