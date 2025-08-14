@@ -40,16 +40,75 @@ const nowISO = () => new Date().toISOString();
 const unaccent = (s = '') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 const eqCity = (a, b) =>
   unaccent(String(a)).toUpperCase().trim() === unaccent(String(b)).toUpperCase().trim();
+// Helpers de texto
+const norm = (s='') => unaccent(String(s)).toLowerCase();
+const hasAny = (s, terms=[]) => terms.some(t => norm(s).includes(norm(t)));
+const within5min = (s) => {
+  const txt = norm(s);
+  if (/(imediat|na hora|instant)/.test(txt)) return true;
+  const m = txt.match(/(\d+)\s*min/);
+  return m ? Number(m[1]) <= 5 : false;
+};
+
+// Avaliação por questão (retorna {ok, motivo})
+function evalQ1(a) { // Rota urgente / múltiplas coletas: decide sozinho x confirma com líder
+  const txt = norm(a);
+  const alinhamento = hasAny(txt, ['confirmo', 'alinho', 'combino', 'valido', 'consulto', 'falo'])
+                   && hasAny(txt, ['lider', 'supervisor', 'coordenador', 'central', 'cooperativa', 'dispatch', 'gestor']);
+  const sozinho = hasAny(txt, ['sozinho', 'por conta', 'eu decido', 'eu escolho']);
+  return alinhamento && !sozinho
+    ? { ok:true, motivo:'Alinhou rota com liderança/central.' }
+    : { ok:false, motivo:'Deveria alinhar a rota com liderança/central em urgências.' };
+}
+
+function evalQ2(a) { // Cliente ausente: contato e atualização rápida
+  const txt = norm(a);
+  const contata = hasAny(txt, ['ligo', 'ligar', 'whatsapp', 'chamo', 'entro em contato', 'tento contato', 'tento contactar', 'tento contatar']);
+  const atualiza = hasAny(txt, ['atualizo', 'registro', 'marco no app', 'sistema', 'plataforma']);
+  const rapido = within5min(txt);
+  return (contata && atualiza && rapido)
+    ? { ok:true, motivo:'Tenta contato e atualiza o sistema em até 5 min.' }
+    : { ok:false, motivo:'Esperado: tentar contato e atualizar o sistema rapidamente (≤5 min).' };
+}
+
+function evalQ3(a) { // Conflito orientação: quem aciona
+  const txt = norm(a);
+  const aciona = hasAny(txt, ['aciono', 'consulto', 'informo', 'alinho', 'escalo'])
+              && hasAny(txt, ['lider', 'coordenador', 'central', 'cooperativa', 'gestor']);
+  return aciona
+    ? { ok:true, motivo:'Escala/alinha com liderança/central no conflito.' }
+    : { ok:false, motivo:'Deveria escalar para liderança/central quando há conflito.' };
+}
+
+function evalQ4(a) { // Item faltando: registro + quem informa primeiro
+  const txt = norm(a);
+  const registra = hasAny(txt, ['registro', 'foto', 'nota', 'app', 'sistema', 'comprovante']);
+  const informa = hasAny(txt, ['farmacia', 'expedicao', 'balcao', 'responsavel', 'lider', 'coordenador']);
+  return (registra && informa)
+    ? { ok:true, motivo:'Registra evidência e informa farmácia/liderança.' }
+    : { ok:false, motivo:'Esperado: registrar (app/foto) e informar farmácia/liderança.' };
+}
+
+function evalQ5(a) { // Atraso: comunicação, antecedência, prioridade
+  const txt = norm(a);
+  const comunicaCliente = hasAny(txt, ['cliente', 'clientes']);
+  const comunicaBase = hasAny(txt, ['farmacia', 'lider', 'coordenador', 'central', 'cooperativa']);
+  const antecedencia = hasAny(txt, ['antecedencia', 'assim que', 'o quanto antes', 'imediat']);
+  const prioriza = hasAny(txt, ['priorizo', 'prioridade', 'rota', 'urgente', 'urgencias']);
+  const pontos = [comunicaCliente, comunicaBase, (antecedencia || within5min(txt)), prioriza].filter(Boolean).length;
+  return pontos >= 2
+    ? { ok:true, motivo:'Comunica e ajusta priorização diante do atraso.' }
+    : { ok:false, motivo:'Esperado: comunicar (cliente/base), avisar com antecedência e priorizar entregas.' };
+}
 
 function scorePerfil({ q1, q2, q3, q4, q5 }) {
-  let s = 0;
-  if (/decid|rápid|rapido/i.test(q1 || '')) s++;
-  if (/ausent|cliente|atualiz|sistema|5 ?min/i.test(q2 || '')) s++;
-  if (/l[ií]der|supervisor|coord/i.test(q3 || '')) s++;
-  if (/registr|nota|inform|farm/i.test(q4 || '')) s++;
-  if (/comunic|anteced|tr[aâ]nsit|chuva|prioriz/i.test(q5 || '')) s++;
-  return { aprovado: s >= 4, nota: s, resumo: `Q1..Q5 OK em ${s}/5` };
+  const avals = [evalQ1(q1), evalQ2(q2), evalQ3(q3), evalQ4(q4), evalQ5(q5)];
+  const nota = avals.filter(a => a.ok).length;
+  const aprovado = nota >= 4; // ajuste de corte
+  const feedback = avals.map((a, i) => `Q${i+1}: ${a.ok ? 'OK' : 'Ajustar'} — ${a.motivo}`);
+  return { aprovado, nota, feedback };
 }
+
 
 async function getRows(spreadsheetId, rangeA1) {
   const sheets = await sheetsClient();
@@ -162,15 +221,27 @@ app.post('/cx', async (req, res) => {
             : t(`Poxa… ${prefixo}no momento não há vagas em ${cidade}.`)
         ];
       }
-    } else if (tag === 'analisar_perfil') {
-      const { q1, q2, q3, q4, q5 } = params;
-      const r = scorePerfil({ q1, q2, q3, q4, q5 });
-      session_params = {
-        perfil_aprovado: r.aprovado,
-        perfil_nota: r.nota,
-        perfil_resumo: r.resumo
-      };
-      messages = [t(`Perfil: ${r.aprovado ? 'Aprovado' : 'Em avaliação/Reprovado'} (nota ${r.nota}/5).`)];
+else if (tag === 'analisar_perfil') {
+  const { q1,q2,q3,q4,q5, nome } = params;
+  const r = scorePerfil({ q1,q2,q3,q4,q5 });
+
+  const firstName = (nome || '').toString().trim().split(' ')[0] || '';
+  const cabecalho = firstName
+    ? `Obrigado, ${firstName}! Vou analisar seu perfil rapidamente.`
+    : 'Obrigado! Vou analisar seu perfil rapidamente.';
+
+  const status = r.aprovado ? 'Aprovado' : 'Em avaliação/Reprovado';
+  const resumo = `Perfil: ${status} (nota ${r.nota}/5).`;
+  const bullets = r.feedback.map(l => `• ${l}`).join('\n');
+
+  session_params = { perfil_aprovado:r.aprovado, perfil_nota:r.nota, perfil_resumo: r.feedback.join(' | ') };
+
+  messages = [
+    t(cabecalho),
+    t(resumo),
+    t(bullets)
+  ];
+}
     } else if (tag === 'listar_vagas') {
       const cidade = params.cidade || '';
       const candidatas = rows.filter(
@@ -215,58 +286,43 @@ app.post('/cx', async (req, res) => {
           t('Vou registrar seus dados e te enviar o link de inscrição.')
         ];
       }
-    } else if (tag === 'salvar_lead') {
-      const {
-        nome,
-        telefone,
-        cidade,
-        q1,
-        q2,
-        q3,
-        q4,
-        q5,
-        perfil_aprovado,
-        perfil_nota,
-        perfil_resumo,
-        vaga_id,
-        vaga_farmacia,
-        vaga_turno,
-        vaga_taxa
-      } = params;
+  else if (tag === 'salvar_lead') {
+  const {
+    nome, telefone,
+    q1, q2, q3, q4, q5,
+    perfil_aprovado, perfil_nota, perfil_resumo
+  } = params;
 
-      const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
-      const taxaStr =
-        vaga_taxa !== undefined && vaga_taxa !== null && !Number.isNaN(Number(vaga_taxa))
-          ? Number(vaga_taxa).toFixed(2)
-          : vaga_taxa || '';
+  const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
+  const dataISO1 = nowISO();
+  const dataISO2 = dataISO1; // você pediu dois DATA_ISO; gravamos o mesmo timestamp
 
-      const linha = [
-        nowISO(),
-        nome || '',
-        telefone || '',
-        cidade || '',
-        q1 || '',
-        q2 || '',
-        q3 || '',
-        q4 || '',
-        q5 || '',
-        perfil_aprovado ? 'Aprovado' : 'Reprovado',
-        perfil_nota ?? '',
-        perfil_resumo ?? '',
-        vaga_id || '',
-        vaga_farmacia || '',
-        vaga_turno || '',
-        taxaStr,
-        protocolo
-      ];
-      await appendRow(SHEETS_LEADS_ID, `${SHEETS_LEADS_TAB}!A1:Z1`, linha);
-      session_params = { protocolo, pipefy_link: PIPEFY_LINK };
-      messages = [
-        t(`Cadastro concluído! Protocolo: ${protocolo}`),
-        t(`Finalize sua inscrição: ${PIPEFY_LINK}`)
-      ];
-    }
+  // Ordem das colunas na planilha Leads (A → M):
+  // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
+  const linha = [
+    dataISO1,
+    nome || '',
+    telefone || '',
+    dataISO2,
+    q1 || '',
+    q2 || '',
+    q3 || '',
+    q4 || '',
+    q5 || '',
+    (perfil_aprovado ? 'Aprovado' : 'Reprovado'),
+    (perfil_nota ?? ''),
+    (perfil_resumo ?? ''),
+    protocolo
+  ];
 
+  await appendRow(SHEETS_LEADS_ID, `${SHEETS_LEADS_TAB}!A1:Z1`, linha);
+
+  session_params = { protocolo };
+  messages = [
+    t(`Cadastro concluído! Protocolo: ${protocolo}`),
+    t(`Finalize sua inscrição: ${PIPEFY_LINK}`)
+  ];
+}
     res.json({
       fulfillment_response: { messages },
       session_info: { parameters: { ...params, ...session_params } }
