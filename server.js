@@ -177,9 +177,10 @@ app.post('/cx', async (req, res) => {
     let session_params = {};
     let messages = [];
 
-    const { rows } = await (tag === 'verificar_cidade' || tag === 'listar_vagas'
-      ? getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`)
-      : { rows: [] });
+    const needVagas = (tag === 'verificar_cidade' || tag === 'listar_vagas');
+    const { rows } = needVagas
+      ? await getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`)
+      : { rows: [] };
 
     if (tag === 'verificar_cidade') {
       // aceita @sys.geo-city (string) ou @sys.location (objeto) e ignora placeholder
@@ -200,7 +201,7 @@ app.post('/cx', async (req, res) => {
       const firstName = nome ? nome.split(' ')[0] : '';
       const prefixo = firstName ? `${firstName}, ` : '';
 
-      // bolha 1: sempre avisa que vai verificar (personalizada)
+      // bolha 1: aviso personalizado
       const bolhaBusca = t(
         `Obrigado${firstName ? `, ${firstName}` : ''}! Vou verificar vagas na sua cidade…`
       );
@@ -221,27 +222,28 @@ app.post('/cx', async (req, res) => {
             : t(`Poxa… ${prefixo}no momento não há vagas em ${cidade}.`)
         ];
       }
-else if (tag === 'analisar_perfil') {
-  const { q1,q2,q3,q4,q5, nome } = params;
-  const r = scorePerfil({ q1,q2,q3,q4,q5 });
 
-  const firstName = (nome || '').toString().trim().split(' ')[0] || '';
-  const cabecalho = firstName
-    ? `Obrigado, ${firstName}! Vou analisar seu perfil rapidamente.`
-    : 'Obrigado! Vou analisar seu perfil rapidamente.';
+    } else if (tag === 'analisar_perfil') {
+      const { q1, q2, q3, q4, q5, nome } = params;
+      const r = scorePerfil({ q1, q2, q3, q4, q5 });
 
-  const status = r.aprovado ? 'Aprovado' : 'Em avaliação/Reprovado';
-  const resumo = `Perfil: ${status} (nota ${r.nota}/5).`;
-  const bullets = r.feedback.map(l => `• ${l}`).join('\n');
+      const firstName = (nome || '').toString().trim().split(' ')[0] || '';
+      const cabecalho = firstName
+        ? `Obrigado, ${firstName}! Vou analisar seu perfil rapidamente.`
+        : 'Obrigado! Vou analisar seu perfil rapidamente.';
 
-  session_params = { perfil_aprovado:r.aprovado, perfil_nota:r.nota, perfil_resumo: r.feedback.join(' | ') };
+      const status = r.aprovado ? 'Aprovado' : 'Em avaliação/Reprovado';
+      const resumo = `Perfil: ${status} (nota ${r.nota}/5).`;
+      const bullets = r.feedback.map(l => `• ${l}`).join('\n');
 
-  messages = [
-    t(cabecalho),
-    t(resumo),
-    t(bullets)
-  ];
-}
+      session_params = {
+        perfil_aprovado: r.aprovado,
+        perfil_nota: r.nota,
+        perfil_resumo: r.feedback.join(' | ')
+      };
+
+      messages = [ t(cabecalho), t(resumo), t(bullets) ];
+
     } else if (tag === 'listar_vagas') {
       const cidade = params.cidade || '';
       const candidatas = rows.filter(
@@ -257,6 +259,7 @@ else if (tag === 'analisar_perfil') {
         session_params = { listado: true, vagas_lista: lista, vagas_idx: idx, vagas_total: total };
         messages = browseMessage(lista[idx], idx, total);
       }
+
     } else if (tag === 'navegar_vagas') {
       const lista = params.vagas_lista || [];
       let idx = Number(params.vagas_idx || 0);
@@ -268,6 +271,7 @@ else if (tag === 'analisar_perfil') {
         session_params = { vagas_idx: idx };
         messages = browseMessage(lista[idx], idx, total);
       }
+
     } else if (tag === 'selecionar_vaga') {
       const lista = params.vagas_lista || [];
       const vagaId = (params.vaga_id || params.VAGA_ID || '').toString().trim();
@@ -286,43 +290,44 @@ else if (tag === 'analisar_perfil') {
           t('Vou registrar seus dados e te enviar o link de inscrição.')
         ];
       }
-  else if (tag === 'salvar_lead') {
-  const {
-    nome, telefone,
-    q1, q2, q3, q4, q5,
-    perfil_aprovado, perfil_nota, perfil_resumo
-  } = params;
 
-  const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
-  const dataISO1 = nowISO();
-  const dataISO2 = dataISO1; // você pediu dois DATA_ISO; gravamos o mesmo timestamp
+    } else if (tag === 'salvar_lead') {
+      const {
+        nome, telefone,
+        q1, q2, q3, q4, q5,
+        perfil_aprovado, perfil_nota, perfil_resumo
+      } = params;
 
-  // Ordem das colunas na planilha Leads (A → M):
-  // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
-  const linha = [
-    dataISO1,
-    nome || '',
-    telefone || '',
-    dataISO2,
-    q1 || '',
-    q2 || '',
-    q3 || '',
-    q4 || '',
-    q5 || '',
-    (perfil_aprovado ? 'Aprovado' : 'Reprovado'),
-    (perfil_nota ?? ''),
-    (perfil_resumo ?? ''),
-    protocolo
-  ];
+      const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
+      const dataISO1 = nowISO();
+      const dataISO2 = dataISO1; // duas colunas DATA_ISO iguais, como solicitado
 
-  await appendRow(SHEETS_LEADS_ID, `${SHEETS_LEADS_TAB}!A1:Z1`, linha);
+      // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
+      const linha = [
+        dataISO1,
+        nome || '',
+        telefone || '',
+        dataISO2,
+        q1 || '',
+        q2 || '',
+        q3 || '',
+        q4 || '',
+        q5 || '',
+        (perfil_aprovado ? 'Aprovado' : 'Reprovado'),
+        (perfil_nota ?? ''),
+        (perfil_resumo ?? ''),
+        protocolo
+      ];
 
-  session_params = { protocolo };
-  messages = [
-    t(`Cadastro concluído! Protocolo: ${protocolo}`),
-    t(`Finalize sua inscrição: ${PIPEFY_LINK}`)
-  ];
-}
+      await appendRow(SHEETS_LEADS_ID, `${SHEETS_LEADS_TAB}!A1:Z1`, linha);
+
+      session_params = { protocolo };
+      messages = [
+        t(`Cadastro concluído! Protocolo: ${protocolo}`),
+        t(`Finalize sua inscrição: ${PIPEFY_LINK}`)
+      ];
+    }
+
     res.json({
       fulfillment_response: { messages },
       session_info: { parameters: { ...params, ...session_params } }
