@@ -17,7 +17,7 @@
     "dotenv": "^16.4.5",
     "googleapis": "^118.0.0",
     "@google-cloud/dialogflow-cx": "^4.6.0",
-    "pb-util": "1.0.3"
+    "pb-util": "1.0.3",
     "@upstash/redis": "^1.28.4",
     "@google-cloud/speech": "^6.4.0"
   }
