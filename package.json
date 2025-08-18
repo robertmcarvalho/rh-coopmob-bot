@@ -1,19 +1,24 @@
 {
   "name": "kelly-combined",
-  "version": "1.0.0",
-  "type": "commonjs",
+  "version": "2.1.0",
+  "description": "Dialogflow CX webhook + WhatsApp middleware + Upstash memory + STT",
   "main": "server.js",
-  "license": "MIT",
-  "dependencies": {
-    "@google-cloud/dialogflow-cx": "^4.5.0",
-    "axios": "^1.7.2",
-    "body-parser": "^1.20.2",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "googleapis": "^131.0.0",
-    "pb-util": "^1.0.3"
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "body-parser": "^1.20.2",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "googleapis": "^118.0.0",
+    "@google-cloud/dialogflow-cx": "^4.6.0",
+    "pb-util": "^3.0.2",
+    "@upstash/redis": "^1.28.4",
+    "@google-cloud/speech": "^6.4.0"
   }
 }
