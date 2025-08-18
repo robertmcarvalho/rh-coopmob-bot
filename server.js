@@ -217,28 +217,31 @@ app.post('/cx', async (req,res)=>{
       }
     }
 
-    else if (tag === 'listar_vagas'){
-      const cidade = params.cidade || '';
-      const candidatas = rows.filter(r => eqCity(r.CIDADE,cidade) && String(r.STATUS||'').toLowerCase()==='aberto');
-      if (!candidatas.length){
-        session_params = { listado:true, vagas_lista:[], vagas_total:0, vagas_idx:0 };
-        messages = [ t('No momento não há vagas abertas nesta cidade.') ];
-      } else {
-        const lista = serializeVagas(candidatas);
-        session_params = {
-          listado: true,
-          vagas_lista: lista,
-          vagas_total: lista.length,
-          vagas_idx: 0,
-          menu_action: '',   // limpa qualquer ação pendente
-          vaga_id: ''        // limpa seleção anterior
-        };
-        const header = t('Aí vão as vagas disponíveis 👇');
-        const lines  = t(lista.slice(0,5).map(v => `* ${vagaLine(v)}  (responda: toque no menu)`).join('\n'));
-        const pl = payload(makeWaListPayload(cidade, lista));
-        messages = [ t('✅ Perfil aprovado! Vamos seguir.'), header, lines, pl ];
-      }
-    }
+else if (tag === 'listar_vagas') {
+  const cidade = params.cidade || '';
+  const candidatas = rows.filter(
+    r => eqCity(r.CIDADE, cidade) && String(r.STATUS||'').toLowerCase()==='aberto'
+  );
+  const total = candidatas.length;
+
+  if (!total) {
+    session_params = { listado: true, vagas_lista: [], vagas_idx: 0, vagas_total: 0, vaga_id: '', menu_action: '' };
+    messages = [ t('Não encontrei vagas abertas neste momento.') ];
+  } else {
+    const lista = serializeVagas(candidatas);
+    const idx = 0;
+    // ⚠️ LIMPE a seleção anterior e o menu_action aqui:
+    session_params = {
+      listado: true,
+      vagas_lista: lista,
+      vagas_idx: idx,
+      vagas_total: total,
+      vaga_id: '',          // <— limpa qualquer escolha antiga
+      menu_action: ''       // <— limpa qualquer comando "next" deixado na sessão
+    };
+    messages = browseMessage(lista[idx], idx, total);
+  }
+}
 
     else if (tag === 'navegar_vagas'){
       const lista = params.vagas_lista || [];
