@@ -48,8 +48,8 @@ function boolish(v) {
   if (v === 1 || v === '1') return true;
   if (v === 0 || v === '0') return false;
   const s = String(v || '').trim().toLowerCase();
-  if (['true', 'verdadeiro', 'sim', 's', 'y', 'yes'].includes(s)) return true;
-  if (['false', 'falso', 'não', 'nao', 'n', 'no'].includes(s)) return false;
+  if (['true','verdadeiro','sim','s','y','yes'].includes(s)) return true;
+  if (['false','falso','não','nao','n','no'].includes(s)) return false;
   return false;
 }
 const within5min = (s) => {
@@ -59,22 +59,19 @@ const within5min = (s) => {
   return m ? Number(m[1]) <= 5 : false;
 };
 
-// Dinheiro: parser robusto e formatação BR
+// Dinheiro
 function parseBRL(val) {
   if (val === null || val === undefined) return NaN;
   if (typeof val === 'number') return val;
   const raw = String(val).replace(/[^\d.,-]/g, '').trim();
   if (!raw) return NaN;
   if (raw.includes(',') && !raw.includes('.')) {
-    // "8,00" ou "1.234,50" (ponto milhar)
     return parseFloat(raw.replace(/\./g, '').replace(',', '.'));
   }
   if (raw.includes('.') && raw.includes(',')) {
-    // "1,234.50" (menos comum no BR), assuma vírgula milhar e ponto decimal
     const a = raw.replace(/,/g, '');
     return parseFloat(a);
   }
-  // só ponto: "8.00"
   return parseFloat(raw);
 }
 function brl(n) {
@@ -86,49 +83,49 @@ function brl(n) {
 function evalQ1(a) {
   const txt = norm(a);
   const alinhamento =
-    hasAny(txt, ['confirmo', 'alinho', 'combino', 'valido', 'consulto', 'falo']) &&
-    hasAny(txt, ['lider', 'supervisor', 'coordenador', 'central', 'cooperativa', 'dispatch', 'gestor']);
-  const sozinho = hasAny(txt, ['sozinho', 'por conta', 'eu decido', 'eu escolho']);
+    hasAny(txt, ['confirmo','alinho','combino','valido','consulto','falo']) &&
+    hasAny(txt, ['lider','supervisor','coordenador','central','cooperativa','dispatch','gestor']);
+  const sozinho = hasAny(txt, ['sozinho','por conta','eu decido','eu escolho']);
   return alinhamento && !sozinho
-    ? { ok: true, motivo: 'Alinhou rota com liderança/central.' }
-    : { ok: false, motivo: 'Deveria alinhar a rota com liderança/central em urgências.' };
+    ? { ok:true, motivo:'Alinhou rota com liderança/central.' }
+    : { ok:false, motivo:'Deveria alinhar a rota com liderança/central em urgências.' };
 }
 function evalQ2(a) {
   const txt = norm(a);
-  const contata = hasAny(txt, ['ligo', 'ligar', 'whatsapp', 'chamo', 'entro em contato', 'tento contato', 'tento contactar', 'tento contatar']);
-  const atualiza = hasAny(txt, ['atualizo', 'registro', 'marco no app', 'sistema', 'plataforma']);
+  const contata = hasAny(txt, ['ligo','ligar','whatsapp','chamo','entro em contato','tento contato','tento contactar','tento contatar']);
+  const atualiza = hasAny(txt, ['atualizo','registro','marco no app','sistema','plataforma']);
   const rapido = within5min(txt);
   return (contata && atualiza && rapido)
-    ? { ok: true, motivo: 'Tenta contato e atualiza o sistema em até 5 min.' }
-    : { ok: false, motivo: 'Esperado: tentar contato e atualizar o sistema rapidamente (≤5 min).' };
+    ? { ok:true, motivo:'Tenta contato e atualiza o sistema em até 5 min.' }
+    : { ok:false, motivo:'Esperado: tentar contato e atualizar o sistema rapidamente (≤5 min).' };
 }
 function evalQ3(a) {
   const txt = norm(a);
   const aciona =
-    hasAny(txt, ['aciono', 'consulto', 'informo', 'alinho', 'escalo']) &&
-    hasAny(txt, ['lider', 'coordenador', 'central', 'cooperativa', 'gestor']);
+    hasAny(txt, ['aciono','consulto','informo','alinho','escalo']) &&
+    hasAny(txt, ['lider','coordenador','central','cooperativa','gestor']);
   return aciona
-    ? { ok: true, motivo: 'Escala/alinha com liderança/central no conflito.' }
-    : { ok: false, motivo: 'Deveria escalar para liderança/central quando há conflito.' };
+    ? { ok:true, motivo:'Escala/alinha com liderança/central no conflito.' }
+    : { ok:false, motivo:'Deveria escalar para liderança/central quando há conflito.' };
 }
 function evalQ4(a) {
   const txt = norm(a);
-  const registra = hasAny(txt, ['registro', 'foto', 'nota', 'app', 'sistema', 'comprovante']);
-  const informa = hasAny(txt, ['farmacia', 'expedicao', 'balcao', 'responsavel', 'lider', 'coordenador']);
+  const registra = hasAny(txt, ['registro','foto','nota','app','sistema','comprovante']);
+  const informa = hasAny(txt, ['farmacia','expedicao','balcao','responsavel','lider','coordenador']);
   return (registra && informa)
-    ? { ok: true, motivo: 'Registra evidência e informa farmácia/liderança.' }
-    : { ok: false, motivo: 'Esperado: registrar (app/foto) e informar farmácia/liderança.' };
+    ? { ok:true, motivo:'Registra evidência e informa farmácia/liderança.' }
+    : { ok:false, motivo:'Esperado: registrar (app/foto) e informar farmácia/liderança.' };
 }
 function evalQ5(a) {
   const txt = norm(a);
-  const comunicaCliente = hasAny(txt, ['cliente', 'clientes']);
-  const comunicaBase = hasAny(txt, ['farmacia', 'lider', 'coordenador', 'central', 'cooperativa']);
-  const antecedencia = hasAny(txt, ['antecedencia', 'assim que', 'o quanto antes', 'imediat']) || within5min(txt);
-  const prioriza = hasAny(txt, ['priorizo', 'prioridade', 'rota', 'urgente', 'urgencias']);
+  const comunicaCliente = hasAny(txt, ['cliente','clientes']);
+  const comunicaBase = hasAny(txt, ['farmacia','lider','coordenador','central','cooperativa']);
+  const antecedencia = hasAny(txt, ['antecedencia','assim que','o quanto antes','imediat']) || within5min(txt);
+  const prioriza = hasAny(txt, ['priorizo','prioridade','rota','urgente','urgencias']);
   const pontos = [comunicaCliente, comunicaBase, antecedencia, prioriza].filter(Boolean).length;
   return pontos >= 2
-    ? { ok: true, motivo: 'Comunica e ajusta priorização diante do atraso.' }
-    : { ok: false, motivo: 'Esperado: comunicar (cliente/base), avisar com antecedência e priorizar entregas.' };
+    ? { ok:true, motivo:'Comunica e ajusta priorização diante do atraso.' }
+    : { ok:false, motivo:'Esperado: comunicar (cliente/base), avisar com antecedência e priorizar entregas.' };
 }
 function scorePerfil({ q1, q2, q3, q4, q5 }) {
   const avals = [evalQ1(q1), evalQ2(q2), evalQ3(q3), evalQ4(q4), evalQ5(q5)];
@@ -180,7 +177,7 @@ function vagaMenuRow(v) {
   const description = `${v.TURNO}${taxaFmt === 'a combinar' ? '' : ` — ${taxaFmt}`}`;
   return {
     id: `select:${v.VAGA_ID}`,
-    title: title.slice(0, 24),         // WhatsApp list title tem limite (~24–36 visível)
+    title: title.slice(0, 24),
     description: description.slice(0, 72)
   };
 }
@@ -289,23 +286,22 @@ app.post('/cx', async (req, res) => {
       } else {
         const lista = serializeVagas(candidatas);
         session_params = { listado: true, vagas_lista: lista, vagas_total: total };
-        // SOMENTE MENU (sem texto duplicado)
-        const rowsList = lista.slice(0, 10).map(vagaMenuRow);
+        // Texto de introdução + MENU (ordem importa)
         messages = [
+          t('Aí vão as vagas disponíveis 👇'),
           payload({
             type: 'wa_list',
             header: `Vagas em ${cidade}`,
             body: 'Toque para escolher uma vaga:',
             footer: '',
             button: 'Selecionar',
-            sections: [{ title: 'Vagas', rows: rowsList }]
+            sections: [{ title: 'Vagas', rows: lista.slice(0, 10).map(vagaMenuRow) }]
           })
         ];
       }
     }
 
     else if (tag === 'navegar_vagas') {
-      // Não usada quando só há menu; mantida por compatibilidade
       messages = [ t('Use o menu acima para escolher a vaga 😉') ];
     }
 
@@ -340,7 +336,6 @@ app.post('/cx', async (req, res) => {
       const dataISO1 = nowISO();
       const dataISO2 = dataISO1;
 
-      // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
       const linha = [
         dataISO1, nome || '', telefone || '', dataISO2,
         q1 || '', q2 || '', q3 || '', q4 || '', q5 || '',
@@ -577,14 +572,16 @@ app.post('/wa/webhook', async (req, res) => {
         userText = '[anexo recebido]';
       }
 
-      // Dialogflow CX
       const cxResp = await cxDetectText(from, userText || '', extraParams);
       const outputs = cxResp.queryResult?.responseMessages || [];
 
-      // Se houver menu (wa_list) neste lote, ignore textos para não duplicar
-      const hasList = outputs.some(isWaListPayload);
+      // 🔧 NOVO: permitir textos ANTES do primeiro wa_list, suprimir textos depois
+      const firstListIdx = outputs.findIndex(isWaListPayload);
+      const hasList = firstListIdx !== -1;
 
-      for (const m of outputs) {
+      for (let i = 0; i < outputs.length; i++) {
+        const m = outputs[i];
+
         if (isWaListPayload(m)) {
           const decoded = decodePayload(m);
           await waSendList(from, {
@@ -603,16 +600,18 @@ app.post('/wa/webhook', async (req, res) => {
           continue;
         }
 
-        if (!hasList && m.text && Array.isArray(m.text.text)) {
-          for (const raw of m.text.text) {
-            const line = (raw || '').trim();
-            if (!line) continue;
-            await waSendBurst(from, line, 450);
+        if (m.text && Array.isArray(m.text.text)) {
+          // Se há menu, só envia textos que VÊM ANTES do menu
+          if (!hasList || i < firstListIdx) {
+            for (const raw of m.text.text) {
+              const line = (raw || '').trim();
+              if (!line) continue;
+              await waSendBurst(from, line, 450);
+            }
           }
           continue;
         }
 
-        // fallback silencioso quando há menu
         if (!hasList) await waSendText(from, '[mensagem recebida]');
       }
     }
