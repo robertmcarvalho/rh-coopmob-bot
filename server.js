@@ -33,7 +33,7 @@ async function sheetsClient() {
   return google.sheets({ version: 'v4', auth: gauth });
 }
 
-// ---- Helpers básicos ----
+// ---- Helpers ----
 const t = (msg) => ({ text: { text: [msg] } });
 const payload = (obj) => ({ payload: obj });
 const nowISO = () => new Date().toISOString();
@@ -59,45 +59,45 @@ const within5min = (s) => {
   return m ? Number(m[1]) <= 5 : false;
 };
 
-// ---- Avaliação de perfil (regras) ----
-function evalQ1(a) { // rota urgente: confirma com liderança
+// ---- Avaliação de perfil (nota mínima = 3) ----
+function evalQ1(a) {
   const txt = norm(a);
   const alinhamento = hasAny(txt, ['confirmo','alinho','combino','valido','consulto','falo'])
-                   && hasAny(txt, ['lider','supervisor','coordenador','central','cooperativa','dispatch','gestor']);
+                    && hasAny(txt, ['lider','supervisor','coordenador','central','cooperativa','dispatch','gestor']);
   const sozinho = hasAny(txt, ['sozinho','por conta','eu decido','eu escolho']);
   return alinhamento && !sozinho;
 }
-function evalQ2(a) { // cliente ausente: contata + atualiza rápido
+function evalQ2(a) {
   const txt = norm(a);
-  const contata = hasAny(txt, ['ligo','whatsapp','chamo','entro em contato','tento contato','contacto','contatar']);
+  const contata  = hasAny(txt, ['ligo','whatsapp','chamo','entro em contato','tento contato','contatar']);
   const atualiza = hasAny(txt, ['atualizo','registro','marco no app','sistema','plataforma','app']);
-  const rapido = within5min(txt);
+  const rapido   = within5min(txt);
   return contata && atualiza && rapido;
 }
-function evalQ3(a) { // conflito: aciona liderança/central
+function evalQ3(a) {
   const txt = norm(a);
   return hasAny(txt, ['aciono','consulto','informo','alinho','escalo'])
       && hasAny(txt, ['lider','coordenador','central','cooperativa','gestor']);
 }
-function evalQ4(a) { // item faltando: registra + informa
+function evalQ4(a) {
   const txt = norm(a);
   const registra = hasAny(txt, ['registro','foto','nota','app','sistema','comprovante']);
-  const informa = hasAny(txt, ['farmacia','expedicao','balcao','responsavel','lider','coordenador']);
+  const informa  = hasAny(txt, ['farmacia','expedicao','balcao','responsavel','lider','coordenador']);
   return registra && informa;
 }
-function evalQ5(a) { // atraso: comunica cliente/base + antecedência/prioriza
+function evalQ5(a) {
   const txt = norm(a);
   const comunicaCliente = hasAny(txt, ['cliente','clientes']);
-  const comunicaBase = hasAny(txt, ['farmacia','lider','coordenador','central','cooperativa']);
-  const antecedencia = hasAny(txt, ['antecedencia','assim que','o quanto antes','imediat']) || within5min(txt);
-  const prioriza = hasAny(txt, ['priorizo','prioridade','rota','urgente','urgencias']);
+  const comunicaBase    = hasAny(txt, ['farmacia','lider','coordenador','central','cooperativa']);
+  const antecedencia    = hasAny(txt, ['antecedencia','assim que','o quanto antes','imediat']) || within5min(txt);
+  const prioriza        = hasAny(txt, ['priorizo','prioridade','rota','urgente','urgencias']);
   const pontos = [comunicaCliente, comunicaBase, antecedencia, prioriza].filter(Boolean).length;
   return pontos >= 2;
 }
 function scorePerfil({ q1,q2,q3,q4,q5 }) {
-  const ok = [evalQ1(q1), evalQ2(q2), evalQ3(q3), evalQ4(q4), evalQ5(q5)];
-  const nota = ok.filter(Boolean).length;
-  const aprovado = nota >= 3; // corte = 3
+  const oks = [evalQ1(q1), evalQ2(q2), evalQ3(q3), evalQ4(q4), evalQ5(q5)];
+  const nota = oks.filter(Boolean).length;
+  const aprovado = nota >= 3;
   return { aprovado, nota };
 }
 
@@ -122,44 +122,43 @@ async function appendRow(spreadsheetId, rangeA1, rowArray) {
   });
 }
 
-// ---- Vagas helpers (lista completa + WhatsApp list) ----
+// ---- Vagas helpers ----
 function serializeVagas(list) {
   return list.map(v => ({
     VAGA_ID: v.VAGA_ID, CIDADE: v.CIDADE, FARMACIA: v.FARMACIA,
     TAXA_ENTREGA: v.TAXA_ENTREGA, TURNO: v.TURNO, STATUS: v.STATUS
   }));
 }
-function vagaPreco(v) {
-  const raw = v.TAXA_ENTREGA || '';
-  const num = Number(String(raw).replace(/[^\d.,-]/g, '').replace(',', '.'));
+function formatPreco(raw) {
+  const num = Number(String(raw || '').replace(/[^\d.,-]/g, '').replace(',', '.'));
   if (!Number.isNaN(num)) return `R$ ${num.toFixed(2)}`;
-  return String(raw).replace(/^\s*R\$\s*R\$\s*/i, 'R$ ').trim();
+  return String(raw || '').replace(/^\s*R\$\s*R\$\s*/i, 'R$ ').trim();
 }
 function vagaToLine(v) {
-  return `ID ${v.VAGA_ID} — ${v.FARMACIA} — ${v.TURNO} — ${vagaPreco(v)}`;
+  return `ID ${v.VAGA_ID} — ${v.FARMACIA} — ${v.TURNO} — ${formatPreco(v.TAXA_ENTREGA)}`;
 }
 function vagaRow(v) {
   return {
     id: `select:${v.VAGA_ID}`,
     title: `${v.FARMACIA}`.slice(0, 24),
-    description: `${v.TURNO} — ${vagaPreco(v)}`
+    description: `${v.TURNO} — ${formatPreco(v.TAXA_ENTREGA)}`
   };
 }
 
 // ---------------- CX WEBHOOK (/cx) ----------------
 app.post('/cx', async (req, res) => {
-  try {
-    const body = req.body || {};
-    const tag = body.fulfillmentInfo?.tag;
-    const params = body.sessionInfo?.parameters || {};
-    let session_params = {};
-    let messages = [];
+  const body = req.body || {};
+  const tag = body.fulfillmentInfo?.tag;
+  const params = body.sessionInfo?.parameters || {};
 
-    const { rows } = await (
-      tag === 'verificar_cidade' || tag === 'listar_vagas'
-        ? getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`)
-        : { rows: [] }
-    );
+  let session_params = {};
+  let messages = [];
+
+  try {
+    const needSheet = ['verificar_cidade', 'listar_vagas'].includes(tag);
+    const { rows } = needSheet
+      ? await getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`)
+      : { rows: [] };
 
     if (tag === 'verificar_cidade') {
       const raw = params.cidade || params['sys.geo-city'] || params['sys.location'] || params.location || '';
@@ -176,7 +175,6 @@ app.post('/cx', async (req, res) => {
       if (!cidade || cidade.toLowerCase() === 'geo-city') {
         session_params = { vagas_abertas: false };
         messages = [bolhaBusca, t(`${prefixo}não entendi a cidade. Pode informar de novo?`)];
-
       } else {
         const abertas = rows.filter(r => eqCity(r.CIDADE, cidade) && String(r.STATUS||'').toLowerCase()==='aberto');
         const vagas_abertas = abertas.length>0;
@@ -203,14 +201,13 @@ app.post('/cx', async (req, res) => {
         ];
       } else {
         const faltas = [];
-        if (!moto) faltas.push('moto com documentação em dia');
-        if (!cnh) faltas.push('CNH A válida');
-        if (!android) faltas.push('celular Android com internet');
-        const lista = faltas.map(f => `• ${f}`).join('\n');
+        if (!moto)   faltas.push('moto com documentação em dia');
+        if (!cnh)    faltas.push('CNH A válida');
+        if (!android)faltas.push('celular Android com internet');
         session_params = { requisitos_ok: false };
         messages = [
           t(`Poxa${firstName ? ', ' + firstName : ''}… para atuar conosco é necessário atender a todos os requisitos:`),
-          t(lista || 'Requisitos não atendidos.'),
+          t(faltas.map(f=>`• ${f}`).join('\n') || 'Requisitos não atendidos.'),
           t('Se quiser, posso te avisar quando abrirmos oportunidades que não exijam todos esses itens. Tudo bem?')
         ];
       }
@@ -227,37 +224,29 @@ app.post('/cx', async (req, res) => {
       session_params = { perfil_aprovado: r.aprovado, perfil_nota: r.nota, perfil_resumo: r.aprovado ? 'Aprovado' : 'Reprovado' };
 
       messages = r.aprovado
-        ? [ t(cabecalho), t('✅ Perfil aprovado! Vamos seguir.') ]
+        ? [ t('✅ Perfil aprovado! Vamos seguir.') ]
         : [ t(cabecalho), t('Obrigado por se candidatar! Pelo perfil informado, neste momento não seguiremos com a vaga. Podemos te avisar quando houver oportunidades mais compatíveis?') ];
 
     } else if (tag === 'listar_vagas') {
+      // Só menu interativo (sem aceitar digitação)
       const cidade = params.cidade || '';
       const candidatas = rows.filter(r => eqCity(r.CIDADE, cidade) && String(r.STATUS||'').toLowerCase()==='aberto');
       const total = candidatas.length;
 
       if (!total) {
         session_params = { listado:true, vagas_lista:[], vagas_total:0, vagas_page:0, per_page:10 };
-        messages = [ t('Não encontrei vagas abertas neste momento.') ];
+        messages = [ t('No momento não há vagas abertas nesta cidade.') ];
       } else {
         const lista = serializeVagas(candidatas);
         const perPage = 10;
         const page = 0;
-        const slice = lista.slice(page*perPage, page*perPage + perPage);
+        const slice = lista.slice(0, perPage);
         const rowsList = slice.map(vagaRow);
-        if (total > perPage) {
-          rowsList.push({ id:'next', title:'Mais opções…', description:`Mostrando ${perPage}/${total}` });
-        }
+        if (total > perPage) rowsList.push({ id:'next', title:'Mais opções…', description:`Mostrando ${perPage}/${total}` });
 
         session_params = { listado:true, vagas_lista:lista, vagas_total:total, vagas_page:page, per_page:perPage };
 
-        const texto = [
-          'Aí vão as vagas disponíveis 👇',
-          ...slice.map(v => `• ${vagaToLine(v)}  (responda: quero ${v.VAGA_ID})`),
-          total>perPage ? 'Para ver mais, responda: próxima' : ''
-        ].filter(Boolean).join('\n');
-
         messages = [
-          t(texto),
           payload({
             type: 'list',
             header: `Vagas em ${cidade}`,
@@ -281,19 +270,10 @@ app.post('/cx', async (req, res) => {
         const start = page * perPage;
         const slice = lista.slice(start, start + perPage);
         const rowsList = slice.map(vagaRow);
-        if (total > (start + perPage)) {
-          rowsList.push({ id:'next', title:'Mais opções…', description:`Mostrando ${Math.min(start + perPage, total)}/${total}` });
-        }
+        if (total > (start + perPage)) rowsList.push({ id:'next', title:'Mais opções…', description:`Mostrando ${Math.min(start + perPage, total)}/${total}` });
         session_params = { vagas_page: page };
 
-        const texto = [
-          'Mais opções 👇',
-          ...slice.map(v => `• ${vagaToLine(v)}  (responda: quero ${v.VAGA_ID})`),
-          (start + perPage) < total ? 'Para ver mais, responda: próxima' : ''
-        ].filter(Boolean).join('\n');
-
         messages = [
-          t(texto),
           payload({
             type: 'list',
             header: 'Outras vagas',
@@ -310,13 +290,13 @@ app.post('/cx', async (req, res) => {
       const v = lista.find(x => String(x.VAGA_ID).trim() === vagaId);
 
       if (!v) {
-        messages = [ t(`Não encontrei a vaga ID ${vagaId} nas opções.`) ];
+        messages = [ t(`Não encontrei a vaga selecionada.`) ];
       } else {
         session_params = {
           vaga_id: v.VAGA_ID,
           vaga_farmacia: v.FARMACIA,
           vaga_turno: v.TURNO,
-          vaga_taxa: vagaPreco(v)
+          vaga_taxa: formatPreco(v.TAXA_ENTREGA)
         };
         messages = [
           t(`Perfeito! Você escolheu: ${vagaToLine(v)}.`),
@@ -329,40 +309,26 @@ app.post('/cx', async (req, res) => {
 
       const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
       const dataISO1 = nowISO();
-      const dataISO2 = dataISO1; // duas colunas DATA_ISO, mesmo timestamp
+      const dataISO2 = dataISO1;
 
-      // Planilha Leads (A→M):
-      // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
       const linha = [
-        dataISO1,
-        nome || '',
-        telefone || '',
-        dataISO2,
+        dataISO1, nome || '', telefone || '', dataISO2,
         q1 || '', q2 || '', q3 || '', q4 || '', q5 || '',
         (perfil_aprovado ? 'Aprovado' : 'Reprovado'),
-        (perfil_nota ?? ''),
-        (perfil_resumo ?? ''),
-        protocolo
+        (perfil_nota ?? ''), (perfil_resumo ?? ''), protocolo
       ];
-
       await appendRow(SHEETS_LEADS_ID, `${SHEETS_LEADS_TAB}!A1:Z1`, linha);
 
       session_params = { protocolo };
-      messages = [
-        t(`Cadastro concluído! Protocolo: ${protocolo}`),
-        t(`Finalize sua inscrição: ${PIPEFY_LINK}`)
-      ];
+      messages = [ t(`Cadastro concluído! Protocolo: ${protocolo}`), t(`Finalize sua inscrição: ${PIPEFY_LINK}`) ];
     }
 
-    res.json({
-      fulfillment_response: { messages },
-      session_info: { parameters: { ...params, ...session_params } }
-    });
-
-  } catch (e) {
-    console.error(e?.response?.data || e);
-    res.json({ fulfillment_response: { messages:[t('Erro interno no webhook.')] } });
+  } catch (err) {
+    console.error('Webhook error (tag=' + tag + '):', err?.response?.data || err);
+    messages = [ t('Erro interno no webhook.') ];
   }
+
+  res.json({ fulfillment_response:{ messages }, session_info:{ parameters:{ ...params, ...session_params } } });
 });
 
 // ---------------- WhatsApp middleware (/wa/webhook) ----------------
@@ -373,15 +339,6 @@ async function waSendText(to, text) {
     messaging_product:'whatsapp', to, type:'text', text:{ body:text }
   }, { headers:{ Authorization:`Bearer ${WA_TOKEN}` } });
 }
-async function waSendButtons(to, bodyText, buttons) {
-  const actionButtons = buttons.slice(0,3).map(b => ({
-    type:'reply', reply:{ id:b.id, title: (b.title||'Opção').slice(0,20) }
-  }));
-  return axios.post(`${WA_BASE}/${WA_PHONE_ID}/messages`, {
-    messaging_product:'whatsapp', to, type:'interactive',
-    interactive:{ type:'button', body:{ text: bodyText.slice(0,1024) }, action:{ buttons: actionButtons } }
-  }, { headers:{ Authorization:`Bearer ${WA_TOKEN}` } });
-}
 async function waSendList(to, { header='Vagas', body='Escolha uma opção', button='Selecionar', rows=[] }) {
   const safeRows = rows.slice(0,10).map(r => ({
     id: String(r.id).slice(0,200),
@@ -389,9 +346,7 @@ async function waSendList(to, { header='Vagas', body='Escolha uma opção', butt
     description: r.description ? String(r.description).slice(0,72) : undefined
   }));
   return axios.post(`${WA_BASE}/${WA_PHONE_ID}/messages`, {
-    messaging_product:'whatsapp',
-    to,
-    type:'interactive',
+    messaging_product:'whatsapp', to, type:'interactive',
     interactive:{
       type:'list',
       header:{ type:'text', text: header.slice(0,60) },
@@ -402,7 +357,7 @@ async function waSendList(to, { header='Vagas', body='Escolha uma opção', butt
   }, { headers:{ Authorization:`Bearer ${WA_TOKEN}` } });
 }
 
-// util: pacing entre mensagens
+// pacing + de-dup simples
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 function splitIntoSegments(text) {
   if (!text) return [];
@@ -411,18 +366,25 @@ function splitIntoSegments(text) {
   const segs = [];
   for (const part of rough) {
     if (part.length <= maxLen) { segs.push(part); continue; }
-    const lines = part.split('\n'); let acc='';
+    const lines = part.split('\n'); let acc = '';
     for (const ln of lines) {
       if ((acc + (acc?'\n':'') + ln).length > maxLen) { if (acc) segs.push(acc); acc = ln; }
-      else { acc = acc ? acc+'\n'+ln : ln; }
+      else { acc = acc ? acc + '\n' + ln : ln; }
     }
     if (acc) segs.push(acc);
   }
   return segs;
 }
-async function waSendBurst(to, rawText, delayMs=450) {
+async function waSendBurst(to, rawText, delayMs=450, lastCache) {
   const segments = splitIntoSegments(rawText);
-  for (const seg of segments) { await waSendText(to, seg); await sleep(delayMs); }
+  for (const seg of segments) {
+    if (!seg) continue;
+    if (!lastCache || seg !== lastCache.last) {
+      await waSendText(to, seg);
+      if (lastCache) lastCache.last = seg;
+      await sleep(delayMs);
+    }
+  }
 }
 
 // ---- Dialogflow CX Sessions (endpoint regional) ----
@@ -441,45 +403,24 @@ async function cxDetectText(waId, text, params = {}) {
   return resp;
 }
 
-// Payload helpers
+// Recognize DF payloads
 function isListPayload(m) {
-  return m && m.payload && (
-    (m.payload.fields && m.payload.fields.type && m.payload.fields.type.stringValue === 'list') ||
-    (m.payload.type === 'list')
-  );
-}
-function isChoicesPayload(m) {
-  return m && m.payload && (
-    (m.payload.fields && m.payload.fields.type && m.payload.fields.type.stringValue === 'choices') ||
-    (m.payload.type === 'choices')
-  );
+  const p = m && m.payload;
+  if (!p) return false;
+  if (p.fields && p.fields.type && p.fields.type.stringValue === 'list') return true;
+  if (p.type === 'list') return true;
+  return false;
 }
 function decodePayload(m) {
-  try { if (m.payload && m.payload.fields) return require('pb-util').struct.decode(m.payload); }
-  catch {}
+  try {
+    if (m.payload && m.payload.fields) return require('pb-util').struct.decode(m.payload);
+  } catch {}
   return m.payload || {};
-}
-function buttonsFromChoices(choices=[]) {
-  return choices.slice(0,3).map(ch => {
-    const data = ch.data || {};
-    let id = ch.id || '';
-    if (!id && data.action) id = data.action === 'select' && data.vaga_id ? `select:${data.vaga_id}` : data.action;
-    const title = ch.title || (data.action === 'next' ? 'Próxima' : `Quero ${data.vaga_id || ''}`);
-    return { id, title };
-  });
-}
-function parseButtonId(id) {
-  if (!id) return { action:'unknown' };
-  const [action, rest] = id.split(':');
-  if (action === 'select') return { action, vaga_id:(rest||'').trim() };
-  if (action === 'next') return { action };
-  try { return JSON.parse(id); } catch {}
-  return { action:id };
 }
 
 // Verify endpoint (WhatsApp)
-app.get('/wa/webhook', (req,res) => {
-  const { ['hub.mode']:mode, ['hub.verify_token']:token, ['hub.challenge']:challenge } = req.query;
+app.get('/wa/webhook', (req, res) => {
+  const { ['hub.mode']: mode, ['hub.verify_token']: token, ['hub.challenge']: challenge } = req.query;
   if (mode === 'subscribe' && token === WA_VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
@@ -499,57 +440,57 @@ app.post('/wa/webhook', async (req, res) => {
       let userText = null;
       const extraParams = { nome: profileName, telefone: from };
 
-      if (msg.type === 'text') {
-        userText = msg.text?.body?.trim();
-
-      } else if (msg.type === 'interactive') {
-        if (msg.interactive.type === 'button_reply') {
-          const id = msg.interactive.button_reply?.id;
-          const parsed = parseButtonId(id);
-          if (parsed.action === 'next') userText = 'próxima';
-          else if (parsed.action === 'select') { userText = `quero ${parsed.vaga_id}`; extraParams.vaga_id = parsed.vaga_id; }
-          else userText = parsed.action;
-
-        } else if (msg.interactive.type === 'list_reply') {
-          const id = msg.interactive.list_reply?.id;
-          const parsed = parseButtonId(id);
-          if (parsed.action === 'select') { userText = `quero ${parsed.vaga_id}`; extraParams.vaga_id = parsed.vaga_id; }
-          else userText = 'próxima';
+      if (msg.type === 'interactive') {
+        if (msg.interactive.type === 'list_reply') {
+          const id = msg.interactive.list_reply?.id || '';
+          if (id === 'next') {
+            // somente menu "próxima página"
+            extraParams.menu_action = 'next';
+            userText = 'MENU'; // texto neutro (será roteado por condição no CX)
+          } else {
+            // id esperado: select:<VAGA_ID>
+            const m = id.match(/^select:(.+)$/);
+            if (m) {
+              extraParams.vaga_id = String(m[1]).trim();
+              userText = 'MENU';
+            } else {
+              userText = 'MENU';
+            }
+          }
+        } else {
+          // ignoramos outros tipos de interactive (não usados)
+          userText = 'MENU';
         }
-
+      } else if (msg.type === 'text') {
+        // Não aceitamos digitação para escolher vaga; apenas repassamos texto ao CX
+        userText = msg.text?.body?.trim() || '';
       } else {
-        userText = '[anexo recebido]';
+        userText = '[anexo]';
       }
 
       // Dialogflow CX
-      const cxResp = await cxDetectText(from, userText, extraParams);
+      const cxResp = await cxDetectText(from, userText || 'MENU', extraParams);
       const outputs = cxResp.queryResult?.responseMessages || [];
 
+      const lastCache = { last: '' };
       for (const m of outputs) {
         if (isListPayload(m)) {
-          const data = decodePayload(m);
-          await waSendList(from, {
-            header: data.header || 'Vagas disponíveis',
-            body: data.body || 'Escolha a melhor opção para você:',
-            button: data.button || 'Selecionar',
-            rows: data.rows || []
-          });
-          continue;
-        }
-        if (isChoicesPayload(m)) {
           const decoded = decodePayload(m);
-          await waSendButtons(from, 'Escolha uma opção:', buttonsFromChoices(decoded.choices || []));
+          await waSendList(from, {
+            header: decoded.header || 'Vagas',
+            body: decoded.body || 'Toque para escolher uma vaga:',
+            button: decoded.button || 'Selecionar',
+            rows: decoded.rows || []
+          });
           continue;
         }
         if (m.text && Array.isArray(m.text.text)) {
           for (const raw of m.text.text) {
             const line = (raw || '').trim();
             if (!line) continue;
-            await waSendBurst(from, line, 450);
+            await waSendBurst(from, line, 420, lastCache);
           }
-          continue;
         }
-        await waSendText(from, '[mensagem recebida]');
       }
     }
     res.sendStatus(200);
@@ -559,6 +500,6 @@ app.post('/wa/webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, () =>
-  console.log(`Kelly combined on :${PORT} (/cx, /wa/webhook) — CX endpoint: ${CX_LOCATION}-dialogflow.googleapis.com`)
-);
+app.listen(PORT, () => {
+  console.log(`Kelly combined on :${PORT} (/cx, /wa/webhook) — CX endpoint: ${CX_LOCATION}-dialogflow.googleapis.com`);
+});
