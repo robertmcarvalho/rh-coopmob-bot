@@ -1,9 +1,9 @@
 # Combined Dockerfile for Kelly (Webhook + WhatsApp middleware)
-FROM node:20-slim
+FROM node:18-alpine
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm i --production --no-audit --no-fund
+RUN npm install --production || npm install --production
 COPY . .
 ENV PORT=8080
 EXPOSE 8080
-CMD ["npm","start"]
+CMD ["node","server.js"]
