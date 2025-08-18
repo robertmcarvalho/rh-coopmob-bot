@@ -546,28 +546,47 @@ app.post('/wa/webhook', async (req, res) => {
 
       if (msg.type === 'text') {
         userText = msg.text?.body?.trim();
-      } else if (msg.type === 'interactive') {
-        if (msg.interactive.type === 'button_reply') {
-          const id = msg.interactive.button_reply?.id;
-          const parsed = parseButtonId(id);
-          if (parsed.action === 'next') userText = 'menu_next';
-          else if (parsed.action === 'select') {
-            userText = 'menu_select';
-            extraParams.vaga_id = parsed.vaga_id;
-            extraParams.menu_action = 'select';
-          } else userText = parsed.action;
-        } else if (msg.interactive.type === 'list_reply') {
-          const id = msg.interactive.list_reply?.id;
-          const parsed = parseButtonId(id);
-          if (parsed.action === 'select') {
-            userText = 'menu_select';
-            extraParams.vaga_id = parsed.vaga_id;
-            extraParams.menu_action = 'select';
-          } else {
-            userText = 'menu_next';
-            extraParams.menu_action = 'next';
-          }
-        }
+} else if (msg.type === 'interactive') {
+  const itype = msg.interactive?.type;
+
+  if (itype === 'button_reply') {
+    const id = msg.interactive.button_reply?.id;
+    const parsed = parseButtonId(id);
+    // mapear botões do nosso menu/choices
+    if (parsed.action === 'select' && parsed.vaga_id) {
+      // NÃO mande o título textual pro CX!
+      userText = '__menu_select__';
+      extraParams.menu_action = 'select';
+      extraParams.vaga_id = parsed.vaga_id;
+    } else if (parsed.action === 'next') {
+      userText = '__menu_next__';
+      extraParams.menu_action = 'next';
+    } else {
+      userText = '__menu_btn__';
+    }
+
+  } else if (itype === 'list_reply') {
+    const id = msg.interactive.list_reply?.id; // ex.: "select:1" ou JSON
+    const parsed = parseButtonId(id);
+
+    // >>> ESTE É O CAMINHO QUE O WHATSAPP USA QUANDO VOCÊ "TOCA PARA ESCOLHER" <<<
+    if (parsed.action === 'select' && parsed.vaga_id) {
+      // Texto sintético para o CX + parâmetros estruturados
+      userText = '__menu_select__';
+      extraParams.menu_action = 'select';
+      extraParams.vaga_id = parsed.vaga_id;
+    } else if (parsed.action === 'next') {
+      userText = '__menu_next__';
+      extraParams.menu_action = 'next';
+    } else {
+      userText = '__menu_list__';
+    }
+
+  } else {
+    // outros tipos interativos que não usamos
+    userText = '__menu_unknown__';
+  }
+}
       } else {
         userText = '[anexo recebido]';
       }
