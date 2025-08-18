@@ -1,4 +1,4 @@
-// Combined server: Dialogflow CX Webhook (/cx) + WhatsApp middleware (/wa/webhook)
+// Combined server: Dialogflow CX Webhook (/cx) + WhatsApp middleware (/wa/webhook) + Memory (Upstash) + Audio STT
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -6,6 +6,8 @@ const axios = require('axios');
 const { google } = require('googleapis');
 const { SessionsClient } = require('@google-cloud/dialogflow-cx');
 const { struct } = require('pb-util');
+const { Redis } = require('@upstash/redis');
+const speech = require('@google-cloud/speech');
 
 // ---- ENV ----
 const {
@@ -18,7 +20,10 @@ const {
   SHEETS_VAGAS_ID, SHEETS_LEADS_ID,
   SHEETS_VAGAS_TAB = 'Vagas',
   SHEETS_LEADS_TAB = 'Leads',
-  PIPEFY_LINK = 'https://seu-link-do-pipefy-aqui'
+  PIPEFY_LINK = 'https://seu-link-do-pipefy-aqui',
+  // Upstash
+  UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN,
+  MEM_TTL_SECONDS = 60 * 60 * 24 * 30 // 30 dias
 } = process.env;
 
 // ---- App ----
@@ -40,7 +45,8 @@ const nowISO = () => new Date().toISOString();
 const unaccent = (s = '') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 const eqCity = (a, b) =>
   unaccent(String(a)).toUpperCase().trim() === unaccent(String(b)).toUpperCase().trim();
-// Helpers de texto
+
+// Texto helpers para avaliação
 const norm = (s='') => unaccent(String(s)).toLowerCase();
 const hasAny = (s, terms=[]) => terms.some(t => norm(s).includes(norm(t)));
 const within5min = (s) => {
@@ -51,7 +57,7 @@ const within5min = (s) => {
 };
 
 // Avaliação por questão (retorna {ok, motivo})
-function evalQ1(a) { // Rota urgente / múltiplas coletas: decide sozinho x confirma com líder
+function evalQ1(a) { // Rota urgente / múltiplas coletas
   const txt = norm(a);
   const alinhamento = hasAny(txt, ['confirmo', 'alinho', 'combino', 'valido', 'consulto', 'falo'])
                    && hasAny(txt, ['lider', 'supervisor', 'coordenador', 'central', 'cooperativa', 'dispatch', 'gestor']);
@@ -60,8 +66,7 @@ function evalQ1(a) { // Rota urgente / múltiplas coletas: decide sozinho x conf
     ? { ok:true, motivo:'Alinhou rota com liderança/central.' }
     : { ok:false, motivo:'Deveria alinhar a rota com liderança/central em urgências.' };
 }
-
-function evalQ2(a) { // Cliente ausente: contato e atualização rápida
+function evalQ2(a) { // Cliente ausente
   const txt = norm(a);
   const contata = hasAny(txt, ['ligo', 'ligar', 'whatsapp', 'chamo', 'entro em contato', 'tento contato', 'tento contactar', 'tento contatar']);
   const atualiza = hasAny(txt, ['atualizo', 'registro', 'marco no app', 'sistema', 'plataforma']);
@@ -70,8 +75,7 @@ function evalQ2(a) { // Cliente ausente: contato e atualização rápida
     ? { ok:true, motivo:'Tenta contato e atualiza o sistema em até 5 min.' }
     : { ok:false, motivo:'Esperado: tentar contato e atualizar o sistema rapidamente (≤5 min).' };
 }
-
-function evalQ3(a) { // Conflito orientação: quem aciona
+function evalQ3(a) { // Conflito orientação
   const txt = norm(a);
   const aciona = hasAny(txt, ['aciono', 'consulto', 'informo', 'alinho', 'escalo'])
               && hasAny(txt, ['lider', 'coordenador', 'central', 'cooperativa', 'gestor']);
@@ -79,8 +83,7 @@ function evalQ3(a) { // Conflito orientação: quem aciona
     ? { ok:true, motivo:'Escala/alinha com liderança/central no conflito.' }
     : { ok:false, motivo:'Deveria escalar para liderança/central quando há conflito.' };
 }
-
-function evalQ4(a) { // Item faltando: registro + quem informa primeiro
+function evalQ4(a) { // Item faltando
   const txt = norm(a);
   const registra = hasAny(txt, ['registro', 'foto', 'nota', 'app', 'sistema', 'comprovante']);
   const informa = hasAny(txt, ['farmacia', 'expedicao', 'balcao', 'responsavel', 'lider', 'coordenador']);
@@ -88,8 +91,7 @@ function evalQ4(a) { // Item faltando: registro + quem informa primeiro
     ? { ok:true, motivo:'Registra evidência e informa farmácia/liderança.' }
     : { ok:false, motivo:'Esperado: registrar (app/foto) e informar farmácia/liderança.' };
 }
-
-function evalQ5(a) { // Atraso: comunicação, antecedência, prioridade
+function evalQ5(a) { // Atraso
   const txt = norm(a);
   const comunicaCliente = hasAny(txt, ['cliente', 'clientes']);
   const comunicaBase = hasAny(txt, ['farmacia', 'lider', 'coordenador', 'central', 'cooperativa']);
@@ -100,16 +102,15 @@ function evalQ5(a) { // Atraso: comunicação, antecedência, prioridade
     ? { ok:true, motivo:'Comunica e ajusta priorização diante do atraso.' }
     : { ok:false, motivo:'Esperado: comunicar (cliente/base), avisar com antecedência e priorizar entregas.' };
 }
-
 function scorePerfil({ q1, q2, q3, q4, q5 }) {
   const avals = [evalQ1(q1), evalQ2(q2), evalQ3(q3), evalQ4(q4), evalQ5(q5)];
   const nota = avals.filter(a => a.ok).length;
-  const aprovado = nota >= 4; // ajuste de corte
+  const aprovado = nota >= 4; // corte padrão
   const feedback = avals.map((a, i) => `Q${i+1}: ${a.ok ? 'OK' : 'Ajustar'} — ${a.motivo}`);
   return { aprovado, nota, feedback };
 }
 
-
+// Sheets helpers
 async function getRows(spreadsheetId, rangeA1) {
   const sheets = await sheetsClient();
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: rangeA1 });
@@ -166,6 +167,28 @@ function browseMessage(v, idx, total) {
     }),
     t(`Responda "quero ${v.VAGA_ID}" para escolher, ou "próxima" para ver outra.`)
   ];
+}
+
+// ---------------- Memory (Upstash) ----------------
+const redis = (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN)
+  ? new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
+  : null;
+
+const MEM_TTL = Number(MEM_TTL_SECONDS) || (60*60*24*30);
+
+async function memGet(key) {
+  if (!redis) return null;
+  try { return await redis.get(key); } catch { return null; }
+}
+async function memSet(key, value) {
+  if (!redis) return;
+  try { await redis.set(key, value, { ex: MEM_TTL }); } catch {}
+}
+async function memMerge(key, patch) {
+  const cur = (await memGet(key)) || {};
+  const next = { ...cur, ...patch };
+  await memSet(key, next);
+  return next;
 }
 
 // ---------------- CX WEBHOOK (/cx) ----------------
@@ -300,7 +323,7 @@ app.post('/cx', async (req, res) => {
 
       const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
       const dataISO1 = nowISO();
-      const dataISO2 = dataISO1; // duas colunas DATA_ISO iguais, como solicitado
+      const dataISO2 = dataISO1; // duas colunas DATA_ISO iguais
 
       // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
       const linha = [
@@ -321,7 +344,7 @@ app.post('/cx', async (req, res) => {
 
       await appendRow(SHEETS_LEADS_ID, `${SHEETS_LEADS_TAB}!A1:Z1`, linha);
 
-      session_params = { protocolo };
+      session_params = { protocolo, pipefy_link: PIPEFY_LINK };
       messages = [
         t(`Cadastro concluído! Protocolo: ${protocolo}`),
         t(`Finalize sua inscrição: ${PIPEFY_LINK}`)
@@ -369,10 +392,10 @@ async function waSendButtons(to, bodyText, buttons) {
   );
 }
 
-// util: pequena pausa entre envios
+// util: pausa
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// util: divide um texto em parágrafos/bloquinhos (duas quebras de linha = novo bloco)
+// util: divide texto em parágrafos (duas quebras de linha)
 function splitIntoSegments(text) {
   if (!text) return [];
   const rough = String(text)
@@ -471,6 +494,46 @@ function parseButtonId(id) {
   return { action: id };
 }
 
+// ---- Audio: WhatsApp media download + Google Speech ----
+const speechClient = new speech.SpeechClient();
+
+async function waGetMediaInfo(mediaId) {
+  const url = `${WA_BASE}/${mediaId}`;
+  const { data } = await axios.get(url, { headers: { Authorization: `Bearer ${WA_TOKEN}` } });
+  // data: { id, mime_type, sha256, file_size, url }
+  return data;
+}
+async function waDownloadMedia(mediaUrl) {
+  const resp = await axios.get(mediaUrl, {
+    responseType: 'arraybuffer',
+    headers: { Authorization: `Bearer ${WA_TOKEN}` }
+  });
+  return { buffer: Buffer.from(resp.data), mime: resp.headers['content-type'] || 'application/octet-stream' };
+}
+function guessEncoding(mime) {
+  const m = (mime || '').toLowerCase();
+  if (m.includes('ogg')) return 'OGG_OPUS';
+  if (m.includes('mpeg') || m.includes('mp3')) return 'MP3';
+  if (m.includes('wav')) return 'LINEAR16';
+  if (m.includes('amr')) return 'AMR';
+  if (m.includes('3gpp')) return 'AMR_WB';
+  return 'OGG_OPUS';
+}
+async function transcribeBuffer(buf, mime) {
+  const encoding = guessEncoding(mime);
+  const audio = { content: buf.toString('base64') };
+  const config = {
+    languageCode: 'pt-BR',
+    encoding,
+    enableAutomaticPunctuation: true,
+    model: 'default'
+  };
+  const request = { audio, config };
+  const [response] = await speechClient.recognize(request);
+  const transcription = response.results?.map(r => r.alternatives?.[0]?.transcript).filter(Boolean).join(' ') || '';
+  return transcription.trim();
+}
+
 // Verify endpoint (WhatsApp)
 app.get('/wa/webhook', (req, res) => {
   const { ['hub.mode']: mode, ['hub.verify_token']: token, ['hub.challenge']: challenge } =
@@ -492,8 +555,13 @@ app.post('/wa/webhook', async (req, res) => {
       const from = msg.from;
       const profileName = contacts?.[0]?.profile?.name;
       let userText = null;
-      const extraParams = { nome: profileName, telefone: from };
+      const memoryKey = `lead:${from}`;
 
+      // Load memory
+      const mem = (await memGet(memoryKey)) || {};
+      const extraParams = { ...mem, nome: profileName || mem.nome, telefone: from };
+
+      // Message types
       if (msg.type === 'text') {
         userText = msg.text?.body?.trim();
       } else if (msg.type === 'interactive') {
@@ -501,17 +569,30 @@ app.post('/wa/webhook', async (req, res) => {
           const id = msg.interactive.button_reply?.id;
           const parsed = parseButtonId(id);
           if (parsed.action === 'next') userText = 'próxima';
-          else if (parsed.action === 'select') {
-            userText = `quero ${parsed.vaga_id}`;
-            extraParams.vaga_id = parsed.vaga_id;
-          } else userText = parsed.action;
+          else if (parsed.action === 'select') { userText = `quero ${parsed.vaga_id}`; extraParams.vaga_id = parsed.vaga_id; }
+          else userText = parsed.action;
         } else if (msg.interactive.type === 'list_reply') {
           const id = msg.interactive.list_reply?.id;
           const parsed = parseButtonId(id);
-          if (parsed.action === 'select') {
-            userText = `quero ${parsed.vaga_id}`;
-            extraParams.vaga_id = parsed.vaga_id;
-          } else userText = 'próxima';
+          if (parsed.action === 'select') { userText = `quero ${parsed.vaga_id}`; extraParams.vaga_id = parsed.vaga_id; }
+          else userText = 'próxima';
+        }
+      } else if (msg.type === 'audio' && msg.audio?.id) {
+        try {
+          const info = await waGetMediaInfo(msg.audio.id);
+          const { buffer, mime } = await waDownloadMedia(info.url);
+          const transcript = await transcribeBuffer(buffer, info.mime_type || mime);
+          if (transcript) {
+            userText = transcript;
+            extraParams.audio_transcript = transcript;
+          } else {
+            await waSendText(from, 'Não consegui entender seu áudio. Pode digitar em texto, por favor?');
+            continue;
+          }
+        } catch (err) {
+          console.error('STT error:', err?.response?.data || err);
+          await waSendText(from, 'Tive um problema para ouvir seu áudio. Pode enviar em texto?');
+          continue;
         }
       } else {
         userText = '[anexo recebido]';
@@ -521,6 +602,20 @@ app.post('/wa/webhook', async (req, res) => {
       const cxResp = await cxDetectText(from, userText, extraParams);
       const outputs = cxResp.queryResult?.responseMessages || [];
 
+      // Update memory with parameters returned by CX (if any)
+      try {
+        const returnedParams = cxResp.queryResult?.parameters
+          ? require('pb-util').struct.decode(cxResp.queryResult.parameters)
+          : {};
+        const mergeFields = ['nome','telefone','cidade','vagas_abertas','moto_ok','cnh_ok','android_ok','q1','q2','q3','q4','q5','perfil_aprovado','perfil_nota','perfil_resumo','vaga_id','vaga_farmacia','vaga_turno','vaga_taxa','protocolo'];
+        const patch = {};
+        for (const k of mergeFields) if (returnedParams[k] !== undefined) patch[k] = returnedParams[k];
+        if (Object.keys(patch).length) await memMerge(memoryKey, patch);
+      } catch (e) {
+        console.error('Memory merge error:', e?.response?.data || e);
+      }
+
+      // Send messages to WhatsApp
       for (const m of outputs) {
         if (isChoicesPayload(m)) {
           const decoded = decodePayload(m);
@@ -531,7 +626,7 @@ app.post('/wa/webhook', async (req, res) => {
           for (const raw of m.text.text) {
             const line = (raw || '').trim();
             if (!line) continue;
-            await waSendBurst(from, line, 450); // bolhas separadas + pacing
+            await waSendBurst(from, line, 450);
           }
           continue;
         }
