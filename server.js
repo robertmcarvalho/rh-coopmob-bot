@@ -1,4 +1,5 @@
-// Combined server: Dialogflow CX Webhook (/cx) + WhatsApp middleware (/wa/webhook) + Memory (Upstash) + Audio STT
+// Combined server: Dialogflow CX Webhook (/cx) + WhatsApp middleware (/wa/webhook)
+// Extras: Memória (Upstash Redis), Áudio→Texto (Google Speech), Avaliação HÍBRIDA (OpenAI + regras)
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -12,18 +13,26 @@ const speech = require('@google-cloud/speech');
 // ---- ENV ----
 const {
   PORT = 8080,
-  // WA
+  // WhatsApp Business (Graph API)
   WA_TOKEN, WA_PHONE_ID, WA_VERIFY_TOKEN,
-  // CX Sessions
+
+  // Dialogflow CX
   GCLOUD_PROJECT, CX_LOCATION, CX_AGENT_ID,
-  // Sheets + Pipefy
+
+  // Google Sheets + Pipefy
   SHEETS_VAGAS_ID, SHEETS_LEADS_ID,
   SHEETS_VAGAS_TAB = 'Vagas',
   SHEETS_LEADS_TAB = 'Leads',
   PIPEFY_LINK = 'https://seu-link-do-pipefy-aqui',
-  // Upstash
+
+  // Memória (Upstash Redis)
   UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN,
-  MEM_TTL_SECONDS = 60 * 60 * 24 * 30 // 30 dias
+  MEM_TTL_SECONDS = 60 * 60 * 24 * 30, // 30 dias
+
+  // IA (OpenAI) para avaliação
+  OPENAI_API_KEY,
+  AI_MODEL = 'gpt-4o-mini',
+  AI_TIMEOUT_MS = 8000
 } = process.env;
 
 // ---- App ----
@@ -45,7 +54,6 @@ const nowISO = () => new Date().toISOString();
 const unaccent = (s = '') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 const eqCity = (a, b) =>
   unaccent(String(a)).toUpperCase().trim() === unaccent(String(b)).toUpperCase().trim();
-// Helpers de texto
 const norm = (s='') => unaccent(String(s)).toLowerCase();
 const hasAny = (s, terms=[]) => terms.some(t => norm(s).includes(norm(t)));
 // normaliza respostas tipo sim/não/true/false para boolean
@@ -65,66 +73,120 @@ const within5min = (s) => {
   return m ? Number(m[1]) <= 5 : false;
 };
 
-// Avaliação por questão (retorna {ok, motivo})
-function evalQ1(a) { // Rota urgente / múltiplas coletas: decide sozinho x confirma com líder
+// ---- Regras de avaliação (determinísticas) ----
+function evalQ1(a) { // rota urgente
   const txt = norm(a);
-  const alinhamento = hasAny(txt, ['confirmo', 'alinho', 'combino', 'valido', 'consulto', 'falo'])
-                   && hasAny(txt, ['lider', 'supervisor', 'coordenador', 'central', 'cooperativa', 'dispatch', 'gestor']);
-  const sozinho = hasAny(txt, ['sozinho', 'por conta', 'eu decido', 'eu escolho']);
+  const alinhamento = hasAny(txt, ['confirmo','alinho','combino','valido','consulto','falo'])
+                   && hasAny(txt, ['lider','lideranca','supervisor','coordenador','central','cooperativa','dispatch','gestor']);
+  const sozinho = hasAny(txt, ['sozinho','por conta','eu decido','eu escolho']);
   return alinhamento && !sozinho
     ? { ok:true, motivo:'Alinhou rota com liderança/central.' }
     : { ok:false, motivo:'Deveria alinhar a rota com liderança/central em urgências.' };
 }
-
-function evalQ2(a) { // Cliente ausente: contato e atualização rápida
+function evalQ2(a) { // cliente ausente
   const txt = norm(a);
-  const contata = hasAny(txt, ['ligo', 'ligar', 'whatsapp', 'chamo', 'entro em contato', 'tento contato', 'tento contactar', 'tento contatar']);
-  const atualiza = hasAny(txt, ['atualizo', 'registro', 'marco no app', 'sistema', 'plataforma']);
-  const rapido = within5min(txt);
+  const contata = hasAny(txt, ['ligo','ligar','whatsapp','chamo','entro em contato','tento contato','tento contactar','tento contatar','contato']);
+  const atualiza = hasAny(txt, ['atualizo','registro','marco no app','sistema','plataforma','app']);
+  const rapido = within5min(txt) || hasAny(txt, ['agora','na hora','imediat']);
   return (contata && atualiza && rapido)
     ? { ok:true, motivo:'Tenta contato e atualiza o sistema em até 5 min.' }
     : { ok:false, motivo:'Esperado: tentar contato e atualizar o sistema rapidamente (≤5 min).' };
 }
-
-function evalQ3(a) { // Conflito orientação: quem aciona
+function evalQ3(a) { // conflito
   const txt = norm(a);
-  const aciona = hasAny(txt, ['aciono', 'consulto', 'informo', 'alinho', 'escalo'])
-              && hasAny(txt, ['lider', 'coordenador', 'central', 'cooperativa', 'gestor']);
+  const aciona = hasAny(txt, ['aciono','consulto','informo','alinho','escalo','falo'])
+              && hasAny(txt, ['lider','lideranca','coordenador','central','cooperativa','gestor','supervisor']);
   return aciona
     ? { ok:true, motivo:'Escala/alinha com liderança/central no conflito.' }
     : { ok:false, motivo:'Deveria escalar para liderança/central quando há conflito.' };
 }
-
-function evalQ4(a) { // Item faltando: registro + quem informa primeiro
+function evalQ4(a) { // item faltando
   const txt = norm(a);
-  const registra = hasAny(txt, ['registro', 'foto', 'nota', 'app', 'sistema', 'comprovante']);
-  const informa = hasAny(txt, ['farmacia', 'expedicao', 'balcao', 'responsavel', 'lider', 'coordenador']);
+  const registra = hasAny(txt, ['registro','foto','nota','app','sistema','comprovante']);
+  const informa = hasAny(txt, ['farmacia','expedicao','balcao','responsavel','lider','coordenador','lideranca']);
   return (registra && informa)
     ? { ok:true, motivo:'Registra evidência e informa farmácia/liderança.' }
     : { ok:false, motivo:'Esperado: registrar (app/foto) e informar farmácia/liderança.' };
 }
-
-function evalQ5(a) { // Atraso: comunicação, antecedência, prioridade
+function evalQ5(a) { // atraso
   const txt = norm(a);
-  const comunicaCliente = hasAny(txt, ['cliente', 'clientes']);
-  const comunicaBase = hasAny(txt, ['farmacia', 'lider', 'coordenador', 'central', 'cooperativa']);
-  const antecedencia = hasAny(txt, ['antecedencia', 'assim que', 'o quanto antes', 'imediat']);
-  const prioriza = hasAny(txt, ['priorizo', 'prioridade', 'rota', 'urgente', 'urgencias']);
-  const pontos = [comunicaCliente, comunicaBase, (antecedencia || within5min(txt)), prioriza].filter(Boolean).length;
+  const comunicaCliente = hasAny(txt, ['cliente','clientes']);
+  const comunicaBase = hasAny(txt, ['farmacia','lider','coordenador','central','cooperativa','base']);
+  const antecedencia = hasAny(txt, ['antecedencia','assim que','o quanto antes','imediat']) || within5min(txt);
+  const prioriza = hasAny(txt, ['priorizo','prioridade','rota','urgente','urgencias','otimizo']);
+  const pontos = [comunicaCliente, comunicaBase, antecedencia, prioriza].filter(Boolean).length;
   return pontos >= 2
     ? { ok:true, motivo:'Comunica e ajusta priorização diante do atraso.' }
     : { ok:false, motivo:'Esperado: comunicar (cliente/base), avisar com antecedência e priorizar entregas.' };
 }
-
 function scorePerfil({ q1, q2, q3, q4, q5 }) {
   const avals = [evalQ1(q1), evalQ2(q2), evalQ3(q3), evalQ4(q4), evalQ5(q5)];
   const nota = avals.filter(a => a.ok).length;
-  const aprovado = nota >= 4; // ajuste de corte
+  const aprovado = nota >= 3; // nota mínima = 3
   const feedback = avals.map((a, i) => `Q${i+1}: ${a.ok ? 'OK' : 'Ajustar'} — ${a.motivo}`);
   return { aprovado, nota, feedback };
 }
 
+// ---- IA: avaliação com rubric (híbrido) ----
+async function aiScorePerfil({ q1, q2, q3, q4, q5 }) {
+  if (!OPENAI_API_KEY) return null; // sem chave, use fallback
+  const rubric = `
+Você é um avaliador de perfil operacional. Avalie 5 respostas (Q1..Q5) de um candidato a entregas de farmácia.
+Regras do rubric (cada item vale 1 ponto):
+- Q1 (rota urgente/múltiplas coletas): positivo se APONTA alinhar/confirmar rota com liderança/central (não decide sozinho).
+- Q2 (cliente ausente): positivo se TENTA CONTATO e ATUALIZA SISTEMA em até ~5 min (aceite “na hora”, “imediato”).
+- Q3 (conflito farmácia x líder): positivo se ESCALA/ALINHA com liderança/central para decidir.
+- Q4 (item faltando): positivo se REGISTRA evidência (app/foto/nota) e INFORMA farmácia/liderança.
+- Q5 (atraso trânsito/chuva): positivo se COMUNICA cliente e base (farmácia/central), com antecedência/rapidez, e INDICA priorização adequada.
+Aprovação: score_total >= 3.
+Responda EXCLUSIVAMENTE em JSON com o esquema:
+{
+  "score_total": 0-5,
+  "aprovado": true|false,
+  "q": {
+    "q1": {"ok": true|false, "motivo": "..." },
+    "q2": {"ok": true|false, "motivo": "..." },
+    "q3": {"ok": true|false, "motivo": "..." },
+    "q4": {"ok": true|false, "motivo": "..." },
+    "q5": {"ok": true|false, "motivo": "..." }
+  }
+}
+`;
+  const user = { q1, q2, q3, q4, q5 };
+  try {
+    const resp = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: AI_MODEL,
+        temperature: 0,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: rubric },
+          { role: 'user', content: JSON.stringify(user) }
+        ]
+      },
+      {
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+        timeout: Number(AI_TIMEOUT_MS) || 8000
+      }
+    );
+    const txt = resp.data?.choices?.[0]?.message?.content || '';
+    const parsed = JSON.parse(txt);
+    if (
+      typeof parsed.score_total === 'number' &&
+      typeof parsed.aprovado === 'boolean' &&
+      parsed.q && parsed.q.q1 && parsed.q.q2 && parsed.q.q3 && parsed.q.q4 && parsed.q.q5
+    ) {
+      return parsed;
+    }
+    return null;
+  } catch (err) {
+    console.error('AI evaluation error:', err?.response?.data || err?.message || err);
+    return null;
+  }
+}
 
+// ---- Google Sheets helpers ----
 async function getRows(spreadsheetId, rangeA1) {
   const sheets = await sheetsClient();
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: rangeA1 });
@@ -149,7 +211,7 @@ async function appendRow(spreadsheetId, rangeA1, rowArray) {
   });
 }
 
-// ---- Vacancy helpers ----
+// ---- Vagas helpers ----
 function serializeVagas(list) {
   return list.map((v) => ({
     VAGA_ID: v.VAGA_ID,
@@ -183,13 +245,12 @@ function browseMessage(v, idx, total) {
   ];
 }
 
-// ---------------- Memory (Upstash) ----------------
+// ---- Memória (Upstash Redis) ----
 const redis = (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN)
   ? new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
   : null;
 
 const MEM_TTL = Number(MEM_TTL_SECONDS) || (60*60*24*30);
-
 async function memGet(key) {
   if (!redis) return null;
   try { return await redis.get(key); } catch { return null; }
@@ -227,18 +288,15 @@ app.post('/cx', async (req, res) => {
         params['sys.location'] ||
         params.location ||
         '';
-
       const cidade =
         typeof raw === 'object'
           ? raw.city || raw['admin-area'] || raw.original || ''
           : String(raw);
 
-      // nome do WhatsApp (primeiro nome)
       const nome = (params.nome || '').toString().trim();
       const firstName = nome ? nome.split(' ')[0] : '';
       const prefixo = firstName ? `${firstName}, ` : '';
 
-      // bolha 1: aviso personalizado
       const bolhaBusca = t(
         `Obrigado${firstName ? `, ${firstName}` : ''}! Vou verificar vagas na sua cidade…`
       );
@@ -269,14 +327,12 @@ app.post('/cx', async (req, res) => {
       const android = boolish(params.android_ok);
 
       if (moto && cnh && android) {
-        // Tudo ok: seta flag e manda seguir para perguntas
         session_params = { requisitos_ok: true };
         messages = [
           t(`${firstName ? firstName + ',' : ''} perfeito! Você atende aos requisitos básicos.`),
           t('Vamos fazer uma avaliação rápida do seu perfil com 5 situações reais do dia a dia. Responda de forma objetiva, combinado?')
         ];
       } else {
-        // Monta lista do que faltou
         const faltas = [];
         if (!moto) faltas.push('moto com documentação em dia');
         if (!cnh) faltas.push('CNH A válida');
@@ -291,25 +347,36 @@ app.post('/cx', async (req, res) => {
       }
 
     } else if (tag === 'analisar_perfil') {
-      const { q1, q2, q3, q4, q5, nome } = params;
-      const r = scorePerfil({ q1, q2, q3, q4, q5 });
+      const { q1, q2, q3, q4, q5 } = params;
 
-      const firstName = (nome || '').toString().trim().split(' ')[0] || '';
-      const cabecalho = firstName
-        ? `Obrigado, ${firstName}! Vou analisar seu perfil rapidamente.`
-        : 'Obrigado! Vou analisar seu perfil rapidamente.';
-
-      const status = r.aprovado ? 'Aprovado' : 'Em avaliação/Reprovado';
-      const resumo = `Perfil: ${status} (nota ${r.nota}/5).`;
-      const bullets = r.feedback.map(l => `• ${l}`).join('\n');
+      // HÍBRIDO: tenta IA, se falhar usa regras
+      let aprovado = false, nota = 0, resumo = '';
+      const ai = await aiScorePerfil({ q1, q2, q3, q4, q5 });
+      if (ai) {
+        aprovado = !!ai.aprovado;
+        nota = Number(ai.score_total) || 0;
+        resumo = `AI: ${JSON.stringify(ai.q)}`; // guardado para auditoria, não exibido ao candidato
+      } else {
+        const r = scorePerfil({ q1, q2, q3, q4, q5 });
+        aprovado = r.aprovado;
+        nota = r.nota;
+        resumo = `Rules: ${r.feedback.join(' | ')}`;
+      }
 
       session_params = {
-        perfil_aprovado: r.aprovado,
-        perfil_nota: r.nota,
-        perfil_resumo: r.feedback.join(' | ')
+        perfil_aprovado: aprovado,
+        perfil_nota: nota,
+        perfil_resumo: resumo
       };
 
-      messages = [ t(cabecalho), t(resumo), t(bullets) ];
+      // Mensagens ao candidato: SOMENTE resultado (sem bullets)
+      if (aprovado) {
+        messages = [ t('✅ Perfil aprovado! Vamos seguir.') ];
+      } else {
+        messages = [
+          t('Obrigado por se candidatar! Neste momento não seguiremos com a vaga. Podemos te avisar quando houver oportunidades mais compatíveis?')
+        ];
+      }
 
     } else if (tag === 'listar_vagas') {
       const cidade = params.cidade || '';
@@ -367,10 +434,9 @@ app.post('/cx', async (req, res) => {
 
       const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
       const dataISO1 = nowISO();
-      const dataISO2 = dataISO1; // você pediu dois DATA_ISO; gravamos o mesmo timestamp
+      const dataISO2 = dataISO1; // segundo timestamp igual, conforme solicitado
 
-      // Ordem das colunas na planilha Leads (A → M):
-      // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
+      // Colunas: DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
       const linha = [
         dataISO1,
         nome || '',
@@ -406,7 +472,7 @@ app.post('/cx', async (req, res) => {
   }
 });
 
-// ---------------- WA MIDDLEWARE (/wa/webhook) ----------------
+// ---------------- WhatsApp MIDDLEWARE (/wa/webhook) ----------------
 const WA_BASE = 'https://graph.facebook.com/v20.0';
 
 async function waSendText(to, text) {
@@ -437,10 +503,8 @@ async function waSendButtons(to, bodyText, buttons) {
   );
 }
 
-// util: pequena pausa entre envios
+// pacing de envio (bolhas separadas)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// util: divide um texto em parágrafos/bloquinhos (duas quebras de linha = novo bloco)
 function splitIntoSegments(text) {
   if (!text) return [];
   const rough = String(text)
@@ -468,8 +532,6 @@ function splitIntoSegments(text) {
   }
   return segments;
 }
-
-// envia um "Agent response" em várias bolhas, com pacing
 async function waSendBurst(to, rawText, delayMs = 450) {
   const segments = splitIntoSegments(rawText);
   if (!segments.length) return;
@@ -501,7 +563,7 @@ async function cxDetectText(waId, text, params = {}) {
   return resp;
 }
 
-// Helpers payload
+// Helpers payload → WhatsApp
 function isChoicesPayload(m) {
   return (
     m &&
@@ -533,13 +595,11 @@ function parseButtonId(id) {
   const [action, rest] = id.split(':');
   if (action === 'select') return { action, vaga_id: (rest || '').trim() };
   if (action === 'next') return { action };
-  try {
-    return JSON.parse(id);
-  } catch {}
+  try { return JSON.parse(id); } catch {}
   return { action: id };
 }
 
-// ---- Audio: WhatsApp media download + Google Speech ----
+// ---- Áudio: WhatsApp media download + Google Speech ----
 const speechClient = new speech.SpeechClient();
 
 async function waGetMediaInfo(mediaId) {
@@ -549,11 +609,17 @@ async function waGetMediaInfo(mediaId) {
   return data;
 }
 async function waDownloadMedia(mediaUrl) {
-  const resp = await axios.get(mediaUrl, {
-    responseType: 'arraybuffer',
-    headers: { Authorization: `Bearer ${WA_TOKEN}` }
-  });
-  return { buffer: Buffer.from(resp.data), mime: resp.headers['content-type'] || 'application/octet-stream' };
+  // Alguns ambientes exigem sem Authorization no 2º GET; tentamos sem e com como fallback
+  try {
+    const resp = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+    return { buffer: Buffer.from(resp.data), mime: resp.headers['content-type'] || 'application/octet-stream' };
+  } catch {
+    const resp2 = await axios.get(mediaUrl, {
+      responseType: 'arraybuffer',
+      headers: { Authorization: `Bearer ${WA_TOKEN}` }
+    });
+    return { buffer: Buffer.from(resp2.data), mime: resp2.headers['content-type'] || 'application/octet-stream' };
+  }
 }
 function guessEncoding(mime) {
   const m = (mime || '').toLowerCase();
@@ -579,15 +645,14 @@ async function transcribeBuffer(buf, mime) {
   return transcription.trim();
 }
 
-// Verify endpoint (WhatsApp)
+// ---- Verificação do webhook do WhatsApp (GET) ----
 app.get('/wa/webhook', (req, res) => {
-  const { ['hub.mode']: mode, ['hub.verify_token']: token, ['hub.challenge']: challenge } =
-    req.query;
+  const { ['hub.mode']: mode, ['hub.verify_token']: token, ['hub.challenge']: challenge } = req.query;
   if (mode === 'subscribe' && token === WA_VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// Receive messages (WhatsApp → CX → WhatsApp)
+// ---- Recebe mensagens do WhatsApp → CX → WhatsApp ----
 app.post('/wa/webhook', async (req, res) => {
   try {
     const entry = req.body.entry?.[0];
@@ -602,11 +667,11 @@ app.post('/wa/webhook', async (req, res) => {
       let userText = null;
       const memoryKey = `lead:${from}`;
 
-      // Load memory
+      // Carrega memória
       const mem = (await memGet(memoryKey)) || {};
       const extraParams = { ...mem, nome: profileName || mem.nome, telefone: from };
 
-      // Message types
+      // Tipo de mensagem
       if (msg.type === 'text') {
         userText = msg.text?.body?.trim();
       } else if (msg.type === 'interactive') {
@@ -647,12 +712,18 @@ app.post('/wa/webhook', async (req, res) => {
       const cxResp = await cxDetectText(from, userText, extraParams);
       const outputs = cxResp.queryResult?.responseMessages || [];
 
-      // Update memory with parameters returned by CX (if any)
+      // Atualiza memória com parâmetros retornados
       try {
         const returnedParams = cxResp.queryResult?.parameters
           ? require('pb-util').struct.decode(cxResp.queryResult.parameters)
           : {};
-        const mergeFields = ['nome','telefone','cidade','vagas_abertas','moto_ok','cnh_ok','android_ok','requisitos_ok','q1','q2','q3','q4','q5','perfil_aprovado','perfil_nota','perfil_resumo','vaga_id','vaga_farmacia','vaga_turno','vaga_taxa','protocolo'];
+        const mergeFields = [
+          'nome','telefone','cidade','vagas_abertas',
+          'moto_ok','cnh_ok','android_ok','requisitos_ok',
+          'q1','q2','q3','q4','q5',
+          'perfil_aprovado','perfil_nota','perfil_resumo',
+          'vaga_id','vaga_farmacia','vaga_turno','vaga_taxa','protocolo'
+        ];
         const patch = {};
         for (const k of mergeFields) if (returnedParams[k] !== undefined) patch[k] = returnedParams[k];
         if (Object.keys(patch).length) await memMerge(memoryKey, patch);
@@ -660,7 +731,7 @@ app.post('/wa/webhook', async (req, res) => {
         console.error('Memory merge error:', e?.response?.data || e);
       }
 
-      // Send messages to WhatsApp
+      // Entrega das mensagens
       for (const m of outputs) {
         if (isChoicesPayload(m)) {
           const decoded = decodePayload(m);
