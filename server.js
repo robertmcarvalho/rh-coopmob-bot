@@ -45,10 +45,19 @@ const nowISO = () => new Date().toISOString();
 const unaccent = (s = '') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 const eqCity = (a, b) =>
   unaccent(String(a)).toUpperCase().trim() === unaccent(String(b)).toUpperCase().trim();
-
-// Texto helpers para avaliação
+// Helpers de texto
 const norm = (s='') => unaccent(String(s)).toLowerCase();
 const hasAny = (s, terms=[]) => terms.some(t => norm(s).includes(norm(t)));
+// normaliza respostas tipo sim/não/true/false para boolean
+function boolish(v) {
+  if (typeof v === 'boolean') return v;
+  if (v === 1 || v === '1') return true;
+  if (v === 0 || v === '0') return false;
+  const s = String(v || '').trim().toLowerCase();
+  if (['true','verdadeiro','sim','s','y','yes'].includes(s)) return true;
+  if (['false','falso','não','nao','n','no'].includes(s)) return false;
+  return false;
+}
 const within5min = (s) => {
   const txt = norm(s);
   if (/(imediat|na hora|instant)/.test(txt)) return true;
@@ -57,7 +66,7 @@ const within5min = (s) => {
 };
 
 // Avaliação por questão (retorna {ok, motivo})
-function evalQ1(a) { // Rota urgente / múltiplas coletas
+function evalQ1(a) { // Rota urgente / múltiplas coletas: decide sozinho x confirma com líder
   const txt = norm(a);
   const alinhamento = hasAny(txt, ['confirmo', 'alinho', 'combino', 'valido', 'consulto', 'falo'])
                    && hasAny(txt, ['lider', 'supervisor', 'coordenador', 'central', 'cooperativa', 'dispatch', 'gestor']);
@@ -66,7 +75,8 @@ function evalQ1(a) { // Rota urgente / múltiplas coletas
     ? { ok:true, motivo:'Alinhou rota com liderança/central.' }
     : { ok:false, motivo:'Deveria alinhar a rota com liderança/central em urgências.' };
 }
-function evalQ2(a) { // Cliente ausente
+
+function evalQ2(a) { // Cliente ausente: contato e atualização rápida
   const txt = norm(a);
   const contata = hasAny(txt, ['ligo', 'ligar', 'whatsapp', 'chamo', 'entro em contato', 'tento contato', 'tento contactar', 'tento contatar']);
   const atualiza = hasAny(txt, ['atualizo', 'registro', 'marco no app', 'sistema', 'plataforma']);
@@ -75,7 +85,8 @@ function evalQ2(a) { // Cliente ausente
     ? { ok:true, motivo:'Tenta contato e atualiza o sistema em até 5 min.' }
     : { ok:false, motivo:'Esperado: tentar contato e atualizar o sistema rapidamente (≤5 min).' };
 }
-function evalQ3(a) { // Conflito orientação
+
+function evalQ3(a) { // Conflito orientação: quem aciona
   const txt = norm(a);
   const aciona = hasAny(txt, ['aciono', 'consulto', 'informo', 'alinho', 'escalo'])
               && hasAny(txt, ['lider', 'coordenador', 'central', 'cooperativa', 'gestor']);
@@ -83,7 +94,8 @@ function evalQ3(a) { // Conflito orientação
     ? { ok:true, motivo:'Escala/alinha com liderança/central no conflito.' }
     : { ok:false, motivo:'Deveria escalar para liderança/central quando há conflito.' };
 }
-function evalQ4(a) { // Item faltando
+
+function evalQ4(a) { // Item faltando: registro + quem informa primeiro
   const txt = norm(a);
   const registra = hasAny(txt, ['registro', 'foto', 'nota', 'app', 'sistema', 'comprovante']);
   const informa = hasAny(txt, ['farmacia', 'expedicao', 'balcao', 'responsavel', 'lider', 'coordenador']);
@@ -91,7 +103,8 @@ function evalQ4(a) { // Item faltando
     ? { ok:true, motivo:'Registra evidência e informa farmácia/liderança.' }
     : { ok:false, motivo:'Esperado: registrar (app/foto) e informar farmácia/liderança.' };
 }
-function evalQ5(a) { // Atraso
+
+function evalQ5(a) { // Atraso: comunicação, antecedência, prioridade
   const txt = norm(a);
   const comunicaCliente = hasAny(txt, ['cliente', 'clientes']);
   const comunicaBase = hasAny(txt, ['farmacia', 'lider', 'coordenador', 'central', 'cooperativa']);
@@ -102,15 +115,16 @@ function evalQ5(a) { // Atraso
     ? { ok:true, motivo:'Comunica e ajusta priorização diante do atraso.' }
     : { ok:false, motivo:'Esperado: comunicar (cliente/base), avisar com antecedência e priorizar entregas.' };
 }
+
 function scorePerfil({ q1, q2, q3, q4, q5 }) {
   const avals = [evalQ1(q1), evalQ2(q2), evalQ3(q3), evalQ4(q4), evalQ5(q5)];
   const nota = avals.filter(a => a.ok).length;
-  const aprovado = nota >= 4; // corte padrão
+  const aprovado = nota >= 4; // ajuste de corte
   const feedback = avals.map((a, i) => `Q${i+1}: ${a.ok ? 'OK' : 'Ajustar'} — ${a.motivo}`);
   return { aprovado, nota, feedback };
 }
 
-// Sheets helpers
+
 async function getRows(spreadsheetId, rangeA1) {
   const sheets = await sheetsClient();
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: rangeA1 });
@@ -246,6 +260,36 @@ app.post('/cx', async (req, res) => {
         ];
       }
 
+    } else if (tag === 'gate_requisitos') {
+      // Valida requisitos coletados no formulário do CX
+      const nome = (params.nome || '').toString().trim();
+      const firstName = nome ? nome.split(' ')[0] : '';
+      const moto = boolish(params.moto_ok);
+      const cnh = boolish(params.cnh_ok);
+      const android = boolish(params.android_ok);
+
+      if (moto && cnh && android) {
+        // Tudo ok: seta flag e manda seguir para perguntas
+        session_params = { requisitos_ok: true };
+        messages = [
+          t(`${firstName ? firstName + ',' : ''} perfeito! Você atende aos requisitos básicos.`),
+          t('Vamos fazer uma avaliação rápida do seu perfil com 5 situações reais do dia a dia. Responda de forma objetiva, combinado?')
+        ];
+      } else {
+        // Monta lista do que faltou
+        const faltas = [];
+        if (!moto) faltas.push('moto com documentação em dia');
+        if (!cnh) faltas.push('CNH A válida');
+        if (!android) faltas.push('celular Android com internet');
+        const lista = faltas.map(f => `• ${f}`).join('\n');
+        session_params = { requisitos_ok: false };
+        messages = [
+          t(`Poxa${firstName ? ', ' + firstName : ''}… para atuar conosco é necessário atender a todos os requisitos:`),
+          t(lista || 'Requisitos não atendidos.'),
+          t('Se quiser, posso te avisar quando abrirmos oportunidades que não exijam todos esses itens. Tudo bem?')
+        ];
+      }
+
     } else if (tag === 'analisar_perfil') {
       const { q1, q2, q3, q4, q5, nome } = params;
       const r = scorePerfil({ q1, q2, q3, q4, q5 });
@@ -323,8 +367,9 @@ app.post('/cx', async (req, res) => {
 
       const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
       const dataISO1 = nowISO();
-      const dataISO2 = dataISO1; // duas colunas DATA_ISO iguais
+      const dataISO2 = dataISO1; // você pediu dois DATA_ISO; gravamos o mesmo timestamp
 
+      // Ordem das colunas na planilha Leads (A → M):
       // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
       const linha = [
         dataISO1,
@@ -392,10 +437,10 @@ async function waSendButtons(to, bodyText, buttons) {
   );
 }
 
-// util: pausa
+// util: pequena pausa entre envios
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// util: divide texto em parágrafos (duas quebras de linha)
+// util: divide um texto em parágrafos/bloquinhos (duas quebras de linha = novo bloco)
 function splitIntoSegments(text) {
   if (!text) return [];
   const rough = String(text)
@@ -607,7 +652,7 @@ app.post('/wa/webhook', async (req, res) => {
         const returnedParams = cxResp.queryResult?.parameters
           ? require('pb-util').struct.decode(cxResp.queryResult.parameters)
           : {};
-        const mergeFields = ['nome','telefone','cidade','vagas_abertas','moto_ok','cnh_ok','android_ok','q1','q2','q3','q4','q5','perfil_aprovado','perfil_nota','perfil_resumo','vaga_id','vaga_farmacia','vaga_turno','vaga_taxa','protocolo'];
+        const mergeFields = ['nome','telefone','cidade','vagas_abertas','moto_ok','cnh_ok','android_ok','requisitos_ok','q1','q2','q3','q4','q5','perfil_aprovado','perfil_nota','perfil_resumo','vaga_id','vaga_farmacia','vaga_turno','vaga_taxa','protocolo'];
         const patch = {};
         for (const k of mergeFields) if (returnedParams[k] !== undefined) patch[k] = returnedParams[k];
         if (Object.keys(patch).length) await memMerge(memoryKey, patch);
