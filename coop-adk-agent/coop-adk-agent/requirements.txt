@@ -1,0 +1,13 @@
+google-adk>=1.11.0
+google-genai>=0.4.0
+google-auth>=2.29.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.136.0
+gspread>=6.1.2
+upstash-redis>=1.1.0
+python-dotenv>=1.0.1
+requests>=2.32.3
+fastapi>=0.112.0
+uvicorn>=0.30.3
+PyYAML>=6.0.1
+orjson>=3.10.7

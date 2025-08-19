@@ -1,0 +1,35 @@
+{
+  "entry": [
+    {
+      "changes": [
+        {
+          "value": {
+            "contacts": [
+              {
+                "wa_id": "5534999999999",
+                "profile": {
+                  "name": "João Silva"
+                }
+              }
+            ],
+            "messages": [
+              {
+                "from": "5534999999999",
+                "id": "wamid.HBgM...",
+                "timestamp": "1724060500",
+                "type": "interactive",
+                "interactive": {
+                  "type": "list_reply",
+                  "list_reply": {
+                    "id": "vaga:123",
+                    "title": "Drogasil — manhã"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
