@@ -430,26 +430,27 @@ app.post('/wa/webhook', async (req, res) => {
       const profileName = contacts?.[0]?.profile?.name || '';
       let extraParams = { nome: profileName, telefone: from };
 
-      // *** CORREÇÃO: Seleção de LISTA via texto em vez de evento ***
+      // *** CORREÇÃO DEFINITIVA: Simular a condição que o CX está esperando ***
       if (msg.type === 'interactive' && msg.interactive?.type === 'list_reply') {
         const id = msg.interactive.list_reply?.id || '';
-        // id esperado: "select:<VAGA_ID>"
         let vagaId = '';
         if (id.startsWith('select:')) vagaId = id.split(':')[1]?.trim() || '';
 
-        // *** LOG PARA DEBUG ***
         console.log('=== LISTA SELECIONADA ===');
         console.log('ID selecionado:', id);
         console.log('Vaga ID extraído:', vagaId);
         console.log('From:', from);
 
-        // *** CORREÇÃO: em vez de evento, enviar como texto para ser processado ***
-        // Isso permitirá que o CX processe naturalmente e defina os parâmetros corretos
-        const resp = await cxDetectText(from, `selecionar vaga ${vagaId}`, { 
-          ...extraParams, 
+        // *** SOLUÇÃO: Fazer 2 chamadas sequenciais ***
+        // 1. Definir os parâmetros na sessão
+        await cxDetectText(from, 'definir_parametros_selecao', { 
+          ...extraParams,
           menu_action: 'select', 
-          vaga_id: vagaId 
+          vaga_id: vagaId
         });
+
+        // 2. Simular uma entrada qualquer para triggerar a condição
+        const resp = await cxDetectText(from, 'continuar', extraParams);
         
         const outputs = resp.queryResult?.responseMessages || [];
 
@@ -468,7 +469,6 @@ app.post('/wa/webhook', async (req, res) => {
             continue;
           }
         }
-        // segue para o próximo WA message (não cai no fluxo de texto)
         continue;
       }
 
