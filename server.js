@@ -176,6 +176,11 @@ app.post('/cx', async (req, res) => {
     let session_params = {};
     let messages = [];
 
+    // *** LOG PARA DEBUG ***
+    console.log('=== CX WEBHOOK ===');
+    console.log('Tag:', tag);
+    console.log('Params:', JSON.stringify(params, null, 2));
+
     const needVagas = (tag === 'verificar_cidade' || tag === 'listar_vagas');
     const { rows } = await (needVagas ? getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`) : { rows:[] });
 
@@ -275,6 +280,12 @@ app.post('/cx', async (req, res) => {
       const lista = params.vagas_lista || [];
       const vagaId = (params.vaga_id || '').toString().trim();
       const v = lista.find(x => String(x.VAGA_ID).trim() === vagaId);
+      
+      console.log('=== SELECIONAR VAGA ===');
+      console.log('Lista de vagas:', JSON.stringify(lista, null, 2));
+      console.log('Vaga ID procurado:', vagaId);
+      console.log('Vaga encontrada:', v);
+      
       if (!v) {
         messages = [ t('Não encontrei a vaga selecionada.') ];
       } else {
@@ -419,15 +430,27 @@ app.post('/wa/webhook', async (req, res) => {
       const profileName = contacts?.[0]?.profile?.name || '';
       let extraParams = { nome: profileName, telefone: from };
 
-      // 1) Seleção de LISTA: tratar por EVENTO e encerrar ciclo (não enviar texto!)
+      // *** CORREÇÃO: Seleção de LISTA via texto em vez de evento ***
       if (msg.type === 'interactive' && msg.interactive?.type === 'list_reply') {
         const id = msg.interactive.list_reply?.id || '';
         // id esperado: "select:<VAGA_ID>"
         let vagaId = '';
         if (id.startsWith('select:')) vagaId = id.split(':')[1]?.trim() || '';
 
-        // dispara evento no CX
-        const resp = await cxDetectEvent(from, 'menu_select', { ...extraParams, menu_action:'select', vaga_id: vagaId });
+        // *** LOG PARA DEBUG ***
+        console.log('=== LISTA SELECIONADA ===');
+        console.log('ID selecionado:', id);
+        console.log('Vaga ID extraído:', vagaId);
+        console.log('From:', from);
+
+        // *** CORREÇÃO: em vez de evento, enviar como texto para ser processado ***
+        // Isso permitirá que o CX processe naturalmente e defina os parâmetros corretos
+        const resp = await cxDetectText(from, `selecionar vaga ${vagaId}`, { 
+          ...extraParams, 
+          menu_action: 'select', 
+          vaga_id: vagaId 
+        });
+        
         const outputs = resp.queryResult?.responseMessages || [];
 
         for (const m of outputs) {
@@ -438,7 +461,10 @@ app.post('/wa/webhook', async (req, res) => {
             continue;
           }
           if (m.text && Array.isArray(m.text.text)) {
-            for (const line of m.text.text) if (line && line.trim()) { await waSendText(from, line); await sleep(200); }
+            for (const line of m.text.text) if (line && line.trim()) { 
+              await waSendText(from, line); 
+              await sleep(200); 
+            }
             continue;
           }
         }
