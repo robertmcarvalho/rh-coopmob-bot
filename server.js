@@ -1,4 +1,4 @@
-// Combined server: Dialogflow CX Webhook (/cx) + WhatsApp middleware (/wa/webhook) + Memory (Upstash) + Audio STT
+// Combined server: Dialogflow CX Webhook (/cx) + WhatsApp middleware (/wa/webhook)
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -6,8 +6,6 @@ const axios = require('axios');
 const { google } = require('googleapis');
 const { SessionsClient } = require('@google-cloud/dialogflow-cx');
 const { struct } = require('pb-util');
-const { Redis } = require('@upstash/redis');
-const speech = require('@google-cloud/speech');
 
 // ---- ENV ----
 const {
@@ -20,10 +18,7 @@ const {
   SHEETS_VAGAS_ID, SHEETS_LEADS_ID,
   SHEETS_VAGAS_TAB = 'Vagas',
   SHEETS_LEADS_TAB = 'Leads',
-  PIPEFY_LINK = 'https://seu-link-do-pipefy-aqui',
-  // Upstash
-  UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN,
-  MEM_TTL_SECONDS = 60 * 60 * 24 * 30 // 30 dias
+  PIPEFY_LINK = 'https://seu-link-do-pipefy-aqui'
 } = process.env;
 
 // ---- App ----
@@ -42,13 +37,19 @@ async function sheetsClient() {
 const t = (msg) => ({ text: { text: [msg] } });
 const payload = (obj) => ({ payload: obj });
 const nowISO = () => new Date().toISOString();
-const unaccent = (s = '') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-const eqCity = (a, b) =>
-  unaccent(String(a)).toUpperCase().trim() === unaccent(String(b)).toUpperCase().trim();
-
-// Texto helpers para avaliação
+const unaccent = (s='') => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+const eqCity = (a,b) => unaccent(String(a)).toUpperCase().trim() === unaccent(String(b)).toUpperCase().trim();
 const norm = (s='') => unaccent(String(s)).toLowerCase();
-const hasAny = (s, terms=[]) => terms.some(t => norm(s).includes(norm(t)));
+const hasAny = (s, terms=[]) => terms.some(x => norm(s).includes(norm(x)));
+function boolish(v) {
+  if (typeof v === 'boolean') return v;
+  if (v === 1 || v === '1') return true;
+  if (v === 0 || v === '0') return false;
+  const s = String(v || '').trim().toLowerCase();
+  if (['true','verdadeiro','sim','s','y','yes'].includes(s)) return true;
+  if (['false','falso','não','nao','n','no'].includes(s)) return false;
+  return false;
+}
 const within5min = (s) => {
   const txt = norm(s);
   if (/(imediat|na hora|instant)/.test(txt)) return true;
@@ -56,57 +57,70 @@ const within5min = (s) => {
   return m ? Number(m[1]) <= 5 : false;
 };
 
-// Avaliação por questão (retorna {ok, motivo})
-function evalQ1(a) { // Rota urgente / múltiplas coletas
+// currency
+function parseTaxa(v) {
+  if (v === null || v === undefined) return NaN;
+  if (typeof v === 'number') return v;
+  const s = String(v).replace(/[^\d,.-]/g, '').replace(/\./g, '').replace(',', '.');
+  const n = Number(s);
+  return Number.isNaN(n) ? NaN : n;
+}
+function fmtBRL(n) {
+  if (Number.isNaN(n)) return '';
+  return `R$ ${n.toFixed(2).replace('.', ',')}`;
+}
+
+// Avaliação perfil
+function evalQ1(a) {
   const txt = norm(a);
-  const alinhamento = hasAny(txt, ['confirmo', 'alinho', 'combino', 'valido', 'consulto', 'falo'])
-                   && hasAny(txt, ['lider', 'supervisor', 'coordenador', 'central', 'cooperativa', 'dispatch', 'gestor']);
-  const sozinho = hasAny(txt, ['sozinho', 'por conta', 'eu decido', 'eu escolho']);
+  const alinhamento = hasAny(txt, ['confirmo','alinho','combino','valido','consulto','falo'])
+                    && hasAny(txt, ['lider','supervisor','coordenador','central','cooperativa','dispatch','gestor']);
+  const sozinho = hasAny(txt, ['sozinho','por conta','eu decido','eu escolho']);
   return alinhamento && !sozinho
     ? { ok:true, motivo:'Alinhou rota com liderança/central.' }
-    : { ok:false, motivo:'Deveria alinhar a rota com liderança/central em urgências.' };
+    : { ok:false, motivo:'Deveria alinhar rota com liderança/central em urgências.' };
 }
-function evalQ2(a) { // Cliente ausente
+function evalQ2(a) {
   const txt = norm(a);
-  const contata = hasAny(txt, ['ligo', 'ligar', 'whatsapp', 'chamo', 'entro em contato', 'tento contato', 'tento contactar', 'tento contatar']);
-  const atualiza = hasAny(txt, ['atualizo', 'registro', 'marco no app', 'sistema', 'plataforma']);
+  const contata = hasAny(txt, ['ligo','ligar','whatsapp','chamo','entro em contato','tento contato','tento contatar','tento contactar']);
+  const atualiza = hasAny(txt, ['atualizo','registro','marco no app','sistema','plataforma','app']);
   const rapido = within5min(txt);
   return (contata && atualiza && rapido)
     ? { ok:true, motivo:'Tenta contato e atualiza o sistema em até 5 min.' }
     : { ok:false, motivo:'Esperado: tentar contato e atualizar o sistema rapidamente (≤5 min).' };
 }
-function evalQ3(a) { // Conflito orientação
+function evalQ3(a) {
   const txt = norm(a);
-  const aciona = hasAny(txt, ['aciono', 'consulto', 'informo', 'alinho', 'escalo'])
-              && hasAny(txt, ['lider', 'coordenador', 'central', 'cooperativa', 'gestor']);
+  const aciona = hasAny(txt, ['aciono','consulto','informo','alinho','escalo'])
+              && hasAny(txt, ['lider','coordenador','central','cooperativa','gestor']);
   return aciona
     ? { ok:true, motivo:'Escala/alinha com liderança/central no conflito.' }
     : { ok:false, motivo:'Deveria escalar para liderança/central quando há conflito.' };
 }
-function evalQ4(a) { // Item faltando
+function evalQ4(a) {
   const txt = norm(a);
-  const registra = hasAny(txt, ['registro', 'foto', 'nota', 'app', 'sistema', 'comprovante']);
-  const informa = hasAny(txt, ['farmacia', 'expedicao', 'balcao', 'responsavel', 'lider', 'coordenador']);
+  const registra = hasAny(txt, ['registro','foto','nota','app','sistema','comprovante']);
+  const informa = hasAny(txt, ['farmacia','expedicao','balcao','responsavel','lider','coordenador']);
   return (registra && informa)
     ? { ok:true, motivo:'Registra evidência e informa farmácia/liderança.' }
     : { ok:false, motivo:'Esperado: registrar (app/foto) e informar farmácia/liderança.' };
 }
-function evalQ5(a) { // Atraso
+function evalQ5(a) {
   const txt = norm(a);
-  const comunicaCliente = hasAny(txt, ['cliente', 'clientes']);
-  const comunicaBase = hasAny(txt, ['farmacia', 'lider', 'coordenador', 'central', 'cooperativa']);
-  const antecedencia = hasAny(txt, ['antecedencia', 'assim que', 'o quanto antes', 'imediat']);
-  const prioriza = hasAny(txt, ['priorizo', 'prioridade', 'rota', 'urgente', 'urgencias']);
-  const pontos = [comunicaCliente, comunicaBase, (antecedencia || within5min(txt)), prioriza].filter(Boolean).length;
+  const comunicaCliente = hasAny(txt, ['cliente','clientes']);
+  const comunicaBase = hasAny(txt, ['farmacia','lider','coordenador','central','cooperativa']);
+  const antecedencia = hasAny(txt, ['antecedencia','assim que','o quanto antes','imediat']) || within5min(txt);
+  const prioriza = hasAny(txt, ['priorizo','prioridade','rota','urgente','urgencias']);
+  const pontos = [comunicaCliente, comunicaBase, antecedencia, prioriza].filter(Boolean).length;
   return pontos >= 2
     ? { ok:true, motivo:'Comunica e ajusta priorização diante do atraso.' }
     : { ok:false, motivo:'Esperado: comunicar (cliente/base), avisar com antecedência e priorizar entregas.' };
 }
-function scorePerfil({ q1, q2, q3, q4, q5 }) {
+function scorePerfil({ q1,q2,q3,q4,q5 }) {
   const avals = [evalQ1(q1), evalQ2(q2), evalQ3(q3), evalQ4(q4), evalQ5(q5)];
   const nota = avals.filter(a => a.ok).length;
-  const aprovado = nota >= 4; // corte padrão
-  const feedback = avals.map((a, i) => `Q${i+1}: ${a.ok ? 'OK' : 'Ajustar'} — ${a.motivo}`);
+  const aprovado = nota >= 3; // corte = 3
+  const feedback = avals.map((a,i)=>`Q${i+1}: ${a.ok ? 'OK' : 'Ajustar'} – ${a.motivo}`);
   return { aprovado, nota, feedback };
 }
 
@@ -117,9 +131,8 @@ async function getRows(spreadsheetId, rangeA1) {
   const values = res.data.values || [];
   if (!values.length) return { header: [], rows: [] };
   const header = values[0];
-  const rows = values.slice(1).map((r) => {
-    const o = {};
-    header.forEach((h, i) => (o[h] = r[i]));
+  const rows = values.slice(1).map(r => {
+    const o = {}; header.forEach((h,i)=>o[h]=r[i]);
     return o;
   });
   return { header, rows };
@@ -127,17 +140,15 @@ async function getRows(spreadsheetId, rangeA1) {
 async function appendRow(spreadsheetId, rangeA1, rowArray) {
   const sheets = await sheetsClient();
   await sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range: rangeA1,
-    valueInputOption: 'USER_ENTERED',
-    insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [rowArray] }
+    spreadsheetId, range: rangeA1,
+    valueInputOption:'USER_ENTERED', insertDataOption:'INSERT_ROWS',
+    requestBody:{ values:[rowArray] }
   });
 }
 
 // ---- Vacancy helpers ----
 function serializeVagas(list) {
-  return list.map((v) => ({
+  return list.map(v => ({
     VAGA_ID: v.VAGA_ID,
     CIDADE: v.CIDADE,
     FARMACIA: v.FARMACIA,
@@ -146,49 +157,14 @@ function serializeVagas(list) {
     STATUS: v.STATUS
   }));
 }
-function vagaToLine(v) {
-  const taxa = Number(v.TAXA_ENTREGA || 0);
-  const taxaFmt = isNaN(taxa) ? v.TAXA_ENTREGA : taxa.toFixed(2);
-  return `ID ${v.VAGA_ID} — ${v.FARMACIA} — ${v.TURNO} — R$ ${taxaFmt}`;
+function vagaTitleShort(v) {
+  // título curtinho (limite do WhatsApp list title)
+  return `ID ${v.VAGA_ID} – ${v.FARMACIA} – ${v.TURNO}`;
 }
-function browseMessage(v, idx, total) {
-  return [
-    t(`Opção ${idx + 1}/${total}: ${vagaToLine(v)}`),
-    payload({
-      type: 'choices',
-      choices: [
-        {
-          id: `select:${v.VAGA_ID}`,
-          title: `Quero essa (ID ${v.VAGA_ID})`,
-          data: { action: 'select', vaga_id: String(v.VAGA_ID) }
-        },
-        { id: `next`, title: 'Próxima', data: { action: 'next' } }
-      ]
-    }),
-    t(`Responda "quero ${v.VAGA_ID}" para escolher, ou "próxima" para ver outra.`)
-  ];
-}
-
-// ---------------- Memory (Upstash) ----------------
-const redis = (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN)
-  ? new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
-  : null;
-
-const MEM_TTL = Number(MEM_TTL_SECONDS) || (60*60*24*30);
-
-async function memGet(key) {
-  if (!redis) return null;
-  try { return await redis.get(key); } catch { return null; }
-}
-async function memSet(key, value) {
-  if (!redis) return;
-  try { await redis.set(key, value, { ex: MEM_TTL }); } catch {}
-}
-async function memMerge(key, patch) {
-  const cur = (await memGet(key)) || {};
-  const next = { ...cur, ...patch };
-  await memSet(key, next);
-  return next;
+function vagaDesc(v) {
+  const n = parseTaxa(v.TAXA_ENTREGA);
+  const taxa = Number.isNaN(n) ? String(v.TAXA_ENTREGA || '') : fmtBRL(n);
+  return `${v.TURNO} – ${taxa}`;
 }
 
 // ---------------- CX WEBHOOK (/cx) ----------------
@@ -200,155 +176,167 @@ app.post('/cx', async (req, res) => {
     let session_params = {};
     let messages = [];
 
-    const needVagas = (tag === 'verificar_cidade' || tag === 'listar_vagas');
-    const { rows } = needVagas
-      ? await getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`)
-      : { rows: [] };
+    // *** LOG PARA DEBUG ***
+    console.log('=== CX WEBHOOK ===');
+    console.log('Tag:', tag);
+    console.log('Params:', JSON.stringify(params, null, 2));
+
+    const needVagas = (tag === 'verificar_cidade' || tag === 'listar_vagas' || tag === 'selecionar_vaga');
+    const { rows } = await (needVagas ? getRows(SHEETS_VAGAS_ID, `${SHEETS_VAGAS_TAB}!A1:Z`) : { rows:[] });
 
     if (tag === 'verificar_cidade') {
-      // aceita @sys.geo-city (string) ou @sys.location (objeto) e ignora placeholder
-      const raw =
-        params.cidade ||
-        params['sys.geo-city'] ||
-        params['sys.location'] ||
-        params.location ||
-        '';
-
-      const cidade =
-        typeof raw === 'object'
-          ? raw.city || raw['admin-area'] || raw.original || ''
-          : String(raw);
-
-      // nome do WhatsApp (primeiro nome)
+      const raw = params.cidade || params['sys.geo-city'] || params['sys.location'] || params.location || '';
+      const cidade = typeof raw === 'object' ? (raw.city || raw['admin-area'] || raw.original || '') : String(raw);
       const nome = (params.nome || '').toString().trim();
-      const firstName = nome ? nome.split(' ')[0] : '';
-      const prefixo = firstName ? `${firstName}, ` : '';
+      const first = nome ? nome.split(' ')[0] : '';
 
-      // bolha 1: aviso personalizado
-      const bolhaBusca = t(
-        `Obrigado${firstName ? `, ${firstName}` : ''}! Vou verificar vagas na sua cidade…`
-      );
+      const bolhaBusca = t(`Obrigado${first ? `, ${first}` : ''}! Vou verificar vagas na sua cidade…`);
 
       if (!cidade || cidade.toLowerCase() === 'geo-city') {
-        session_params = { vagas_abertas: false };
-        messages = [bolhaBusca, t(`${prefixo}não entendi a cidade. Pode informar de novo?`)];
+        session_params = { vagas_abertas:false };
+        messages = [bolhaBusca, t(`${first ? first+', ' : ''}não entendi a cidade. Pode informar de novo?`)];
       } else {
-        const abertas = rows.filter(
-          (r) => eqCity(r.CIDADE, cidade) && String(r.STATUS || '').toLowerCase() === 'aberto'
-        );
-        const vagas_abertas = abertas.length > 0;
+        const abertas = rows.filter(r => eqCity(r.CIDADE, cidade) && String(r.STATUS||'').toLowerCase()==='aberto');
+        const vagas_abertas = abertas.length>0;
         session_params = { vagas_abertas, cidade };
         messages = [
           bolhaBusca,
-          vagas_abertas
-            ? t(`Ótimo! ${prefixo}temos vagas em ${cidade}.`)
-            : t(`Poxa… ${prefixo}no momento não há vagas em ${cidade}.`)
+          vagas_abertas ? t(`Ótimo! ${first ? first+', ' : ''}temos vagas em ${cidade}.`)
+                        : t(`Poxa… ${first ? first+', ' : ''}no momento não há vagas em ${cidade}.`)
         ];
       }
+    }
 
-    } else if (tag === 'analisar_perfil') {
-      const { q1, q2, q3, q4, q5, nome } = params;
-      const r = scorePerfil({ q1, q2, q3, q4, q5 });
+    else if (tag === 'gate_requisitos') {
+      const nome = (params.nome || '').toString().trim();
+      const first = nome ? nome.split(' ')[0] : '';
+      const moto = boolish(params.moto_ok);
+      const cnh = boolish(params.cnh_ok);
+      const android = boolish(params.android_ok);
 
-      const firstName = (nome || '').toString().trim().split(' ')[0] || '';
-      const cabecalho = firstName
-        ? `Obrigado, ${firstName}! Vou analisar seu perfil rapidamente.`
-        : 'Obrigado! Vou analisar seu perfil rapidamente.';
+      if (moto && cnh && android) {
+        session_params = { requisitos_ok:true };
+        messages = [
+          t(`${first ? first+', ' : ''}perfeito! Você atende aos requisitos básicos.`),
+          t('Vamos fazer uma avaliação rápida do seu perfil com 5 situações reais do dia a dia. Responda de forma objetiva, combinado?')
+        ];
+      } else {
+        const faltas = [];
+        if (!moto) faltas.push('moto com documentação em dia');
+        if (!cnh) faltas.push('CNH A válida');
+        if (!android) faltas.push('celular Android com internet');
+        session_params = { requisitos_ok:false };
+        messages = [
+          t(`Poxa${first ? ', '+first : ''}… para atuar conosco é necessário atender a todos os requisitos:`),
+          t(faltas.map(f=>`• ${f}`).join('\n')),
+          t('Se quiser, posso te avisar quando abrirmos oportunidades que não exijam todos esses itens. Tudo bem?')
+        ];
+      }
+    }
 
-      const status = r.aprovado ? 'Aprovado' : 'Em avaliação/Reprovado';
-      const resumo = `Perfil: ${status} (nota ${r.nota}/5).`;
-      const bullets = r.feedback.map(l => `• ${l}`).join('\n');
+    else if (tag === 'analisar_perfil') {
+      const { q1,q2,q3,q4,q5, nome } = params;
+      const r = scorePerfil({ q1,q2,q3,q4,q5 });
+      session_params = { perfil_aprovado:r.aprovado, perfil_nota:r.nota, perfil_resumo:r.feedback.join(' | ') };
+      if (r.aprovado) {
+        messages = [ t('✅ Perfil aprovado! Vamos seguir.') ];
+      } else {
+        messages = [ t('Obrigado por se candidatar! Pelo perfil informado, neste momento não seguiremos com a vaga. Podemos te avisar quando houver oportunidades mais compatíveis?') ];
+      }
+    }
 
-      session_params = {
-        perfil_aprovado: r.aprovado,
-        perfil_nota: r.nota,
-        perfil_resumo: r.feedback.join(' | ')
-      };
-
-      messages = [ t(cabecalho), t(resumo), t(bullets) ];
-
-    } else if (tag === 'listar_vagas') {
+    else if (tag === 'listar_vagas') {
       const cidade = params.cidade || '';
-      const candidatas = rows.filter(
-        (r) => eqCity(r.CIDADE, cidade) && String(r.STATUS || '').toLowerCase() === 'aberto'
-      );
+      const candidatas = rows.filter(r => eqCity(r.CIDADE, cidade) && String(r.STATUS||'').toLowerCase()==='aberto');
       const total = candidatas.length;
+
       if (!total) {
-        session_params = { listado: true, vagas_lista: [], vagas_idx: 0, vagas_total: 0 };
-        messages = [t('Não encontrei vagas abertas neste momento.')];
+        session_params = { listado:true, vagas_lista:[], vagas_total:0 };
+        messages = [ t('Não encontrei vagas abertas neste momento.') ];
       } else {
         const lista = serializeVagas(candidatas);
-        const idx = 0;
-        session_params = { listado: true, vagas_lista: lista, vagas_idx: idx, vagas_total: total };
-        messages = browseMessage(lista[idx], idx, total);
+        session_params = { listado:true, vagas_lista:lista, vagas_total:lista.length };
+        // payload especial para o middleware do WhatsApp enviar LISTA nativa
+        const rowsList = lista.map(v => ({
+          id: `select:${v.VAGA_ID}`,
+          title: vagaTitleShort(v).slice(0, 24),       // limite seguro no título
+          description: `${v.TURNO} – ${fmtBRL(parseTaxa(v.TAXA_ENTREGA))}`.slice(0, 72)
+        }));
+        messages = [
+          t('Aí vão as vagas disponíveis 👇'),
+          payload({
+            type: 'wa_list',
+            header: `Vagas em ${cidade}`,
+            body: 'Toque para escolher uma vaga:',
+            button: 'Selecionar',
+            rows: rowsList
+          })
+        ];
       }
+    }
 
-    } else if (tag === 'navegar_vagas') {
+    else if (tag === 'selecionar_vaga') {
+      // CORREÇÃO: Buscar vaga diretamente no banco se não estiver na lista da sessão
       const lista = params.vagas_lista || [];
-      let idx = Number(params.vagas_idx || 0);
-      const total = Number(params.vagas_total || lista.length || 0);
-      if (!total) {
-        messages = [t('Não há mais vagas para navegar.')];
-      } else {
-        idx = (idx + 1) % total;
-        session_params = { vagas_idx: idx };
-        messages = browseMessage(lista[idx], idx, total);
+      const vagaId = (params.vaga_id || '').toString().trim();
+      
+      console.log('=== SELECIONAR VAGA - CX WEBHOOK ===');
+      console.log('Lista de vagas na sessão:', JSON.stringify(lista, null, 2));
+      console.log('Vaga ID procurado:', vagaId);
+      
+      let v = lista.find(x => String(x.VAGA_ID).trim() === vagaId);
+      
+      // Se não encontrou na lista da sessão, busca direto no banco
+      if (!v && vagaId) {
+        console.log('Vaga não encontrada na sessão, buscando no banco...');
+        const vagaBanco = rows.find(r => String(r.VAGA_ID).trim() === vagaId && String(r.STATUS||'').toLowerCase() === 'aberto');
+        if (vagaBanco) {
+          v = {
+            VAGA_ID: vagaBanco.VAGA_ID,
+            CIDADE: vagaBanco.CIDADE,
+            FARMACIA: vagaBanco.FARMACIA,
+            TAXA_ENTREGA: vagaBanco.TAXA_ENTREGA,
+            TURNO: vagaBanco.TURNO,
+            STATUS: vagaBanco.STATUS
+          };
+          console.log('Vaga encontrada no banco:', v);
+        }
       }
-
-    } else if (tag === 'selecionar_vaga') {
-      const lista = params.vagas_lista || [];
-      const vagaId = (params.vaga_id || params.VAGA_ID || '').toString().trim();
-      const v = lista.find((x) => String(x.VAGA_ID).trim() === vagaId);
+      
       if (!v) {
-        messages = [t(`Não encontrei a vaga ID ${vagaId} nas opções.`)];
+        messages = [ t('Não encontrei a vaga selecionada.') ];
       } else {
+        const n = parseTaxa(v.TAXA_ENTREGA);
         session_params = {
           vaga_id: v.VAGA_ID,
           vaga_farmacia: v.FARMACIA,
           vaga_turno: v.TURNO,
-          vaga_taxa: Number(v.TAXA_ENTREGA || 0)
+          vaga_taxa: Number.isNaN(n) ? '' : Number(n)
         };
-        messages = [
-          t(`Perfeito! Você escolheu: ${vagaToLine(v)}.`),
-          t('Vou registrar seus dados e te enviar o link de inscrição.')
-        ];
+        messages = [ t(`Perfeito! Você escolheu: ID ${v.VAGA_ID} – ${v.FARMACIA} – ${v.TURNO} – ${fmtBRL(Number(n))}`) ];
       }
+    }
 
-    } else if (tag === 'salvar_lead') {
+    else if (tag === 'salvar_lead') {
       const {
-        nome, telefone,
-        q1, q2, q3, q4, q5,
+        nome, telefone, q1,q2,q3,q4,q5,
         perfil_aprovado, perfil_nota, perfil_resumo
       } = params;
 
       const protocolo = `LEAD-${Date.now().toString().slice(-6)}`;
       const dataISO1 = nowISO();
-      const dataISO2 = dataISO1; // duas colunas DATA_ISO iguais
+      const dataISO2 = dataISO1;
 
-      // DATA_ISO | NOME | TELEFONE | DATA_ISO | Q1 | Q2 | Q3 | Q4 | Q5 | PERFIL_APROVADO | PERFIL_NOTA | PERFIL_RESUMO | PROTOCOLO
       const linha = [
-        dataISO1,
-        nome || '',
-        telefone || '',
-        dataISO2,
-        q1 || '',
-        q2 || '',
-        q3 || '',
-        q4 || '',
-        q5 || '',
+        dataISO1, (nome||''), (telefone||''), dataISO2,
+        q1||'', q2||'', q3||'', q4||'', q5||'',
         (perfil_aprovado ? 'Aprovado' : 'Reprovado'),
-        (perfil_nota ?? ''),
-        (perfil_resumo ?? ''),
-        protocolo
+        (perfil_nota ?? ''), (perfil_resumo ?? ''), protocolo
       ];
-
       await appendRow(SHEETS_LEADS_ID, `${SHEETS_LEADS_TAB}!A1:Z1`, linha);
 
-      session_params = { protocolo, pipefy_link: PIPEFY_LINK };
-      messages = [
-        t(`Cadastro concluído! Protocolo: ${protocolo}`),
-        t(`Finalize sua inscrição: ${PIPEFY_LINK}`)
-      ];
+      session_params = { protocolo };
+      messages = [ t(`Cadastro concluído! Protocolo: ${protocolo}`), t(`Finalize sua inscrição: ${PIPEFY_LINK}`) ];
     }
 
     res.json({
@@ -356,95 +344,53 @@ app.post('/cx', async (req, res) => {
       session_info: { parameters: { ...params, ...session_params } }
     });
   } catch (e) {
-    console.error(e?.response?.data || e);
-    res.json({ fulfillment_response: { messages: [t('Erro interno no webhook.')] } });
+    console.error('CX webhook error:', e?.response?.data || e);
+    res.json({ fulfillment_response:{ messages:[t('Erro interno no webhook.')] } });
   }
 });
 
 // ---------------- WA MIDDLEWARE (/wa/webhook) ----------------
 const WA_BASE = 'https://graph.facebook.com/v20.0';
 
-async function waSendText(to, text) {
-  return axios.post(
-    `${WA_BASE}/${WA_PHONE_ID}/messages`,
-    { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-    { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
-  );
-}
-async function waSendButtons(to, bodyText, buttons) {
-  const actionButtons = buttons.slice(0, 3).map((b) => ({
-    type: 'reply',
-    reply: { id: b.id, title: (b.title || 'Opção').slice(0, 20) }
-  }));
-  return axios.post(
-    `${WA_BASE}/${WA_PHONE_ID}/messages`,
-    {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'interactive',
-      interactive: {
-        type: 'button',
-        body: { text: bodyText.slice(0, 1024) },
-        action: { buttons: actionButtons }
-      }
-    },
-    { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
-  );
-}
+// send list
+async function waSendList(to, { header, body, button, rows }) {
+  const sections = [{
+    title: header?.slice(0,24) || 'Vagas',
+    rows: rows.map(r => ({
+      id: r.id,
+      title: (r.title || '').slice(1, 25).trim() ? r.title.slice(0,24) : 'Opção',
+      description: (r.description || '').slice(0,72)
+    }))
+  }];
 
-// util: pausa
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// util: divide texto em parágrafos (duas quebras de linha)
-function splitIntoSegments(text) {
-  if (!text) return [];
-  const rough = String(text)
-    .split(/\n{2,}/g)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const maxLen = 900;
-  const segments = [];
-  for (const part of rough) {
-    if (part.length <= maxLen) {
-      segments.push(part);
-    } else {
-      const lines = part.split('\n');
-      let acc = '';
-      for (const ln of lines) {
-        if ((acc + (acc ? '\n' : '') + ln).length > maxLen) {
-          if (acc) segments.push(acc);
-          acc = ln;
-        } else {
-          acc = acc ? acc + '\n' + ln : ln;
-        }
-      }
-      if (acc) segments.push(acc);
+  return axios.post(`${WA_BASE}/${WA_PHONE_ID}/messages`, {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      header: { type: 'text', text: header?.slice(0,60) || 'Vagas' },
+      body: { text: body?.slice(0,1024) || 'Escolha uma vaga:' },
+      action: { button: (button || 'Selecionar').slice(0,20), sections }
     }
-  }
-  return segments;
+  }, { headers:{ Authorization:`Bearer ${WA_TOKEN}` }});
 }
 
-// envia um "Agent response" em várias bolhas, com pacing
-async function waSendBurst(to, rawText, delayMs = 450) {
-  const segments = splitIntoSegments(rawText);
-  if (!segments.length) return;
-  for (const seg of segments) {
-    await waSendText(to, seg);
-    await sleep(delayMs);
-  }
+async function waSendText(to, text) {
+  return axios.post(`${WA_BASE}/${WA_PHONE_ID}/messages`, {
+    messaging_product:'whatsapp', to, type:'text', text:{ body:text }
+  }, { headers:{ Authorization:`Bearer ${WA_TOKEN}` } });
 }
+
+// small delay between messages
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ---- CX Sessions (endpoint regional) ----
 const DFCX_ENDPOINT = `${CX_LOCATION}-dialogflow.googleapis.com`;
 const cxClient = new SessionsClient({ apiEndpoint: DFCX_ENDPOINT });
 
 function sessionPath(waId) {
-  return cxClient.projectLocationAgentSessionPath(
-    GCLOUD_PROJECT,
-    CX_LOCATION,
-    CX_AGENT_ID,
-    waId
-  );
+  return cxClient.projectLocationAgentSessionPath(GCLOUD_PROJECT, CX_LOCATION, CX_AGENT_ID, waId);
 }
 async function cxDetectText(waId, text, params = {}) {
   const request = {
@@ -455,17 +401,23 @@ async function cxDetectText(waId, text, params = {}) {
   const [resp] = await cxClient.detectIntent(request);
   return resp;
 }
+async function cxDetectEvent(waId, event, params = {}) {
+  const request = {
+    session: sessionPath(waId),
+    queryInput: { event: { event }, languageCode: 'pt-BR' },
+    queryParams: { parameters: struct.encode(params) }
+  };
+  const [resp] = await cxClient.detectIntent(request);
+  return resp;
+}
 
-// Helpers payload
-function isChoicesPayload(m) {
-  return (
-    m &&
-    m.payload &&
-    ((m.payload.fields &&
-      m.payload.fields.type &&
-      m.payload.fields.type.stringValue === 'choices') ||
-      m.payload.type === 'choices')
-  );
+// Helper para payloads
+function isWaListPayload(m) {
+  const p = m?.payload;
+  if (!p) return false;
+  if (p.type === 'wa_list') return true;
+  if (p.fields && p.fields.type && p.fields.type.stringValue === 'wa_list') return true;
+  return false;
 }
 function decodePayload(m) {
   try {
@@ -473,71 +425,10 @@ function decodePayload(m) {
   } catch {}
   return m.payload || {};
 }
-function buttonsFromChoices(choices = []) {
-  return choices.slice(0, 3).map((ch) => {
-    const data = ch.data || {};
-    let id = ch.id || '';
-    if (!id && data.action)
-      id = data.action === 'select' && data.vaga_id ? `select:${data.vaga_id}` : data.action;
-    const title = ch.title || (data.action === 'next' ? 'Próxima' : `Quero ${data.vaga_id || ''}`);
-    return { id, title };
-  });
-}
-function parseButtonId(id) {
-  if (!id) return { action: 'unknown' };
-  const [action, rest] = id.split(':');
-  if (action === 'select') return { action, vaga_id: (rest || '').trim() };
-  if (action === 'next') return { action };
-  try {
-    return JSON.parse(id);
-  } catch {}
-  return { action: id };
-}
-
-// ---- Audio: WhatsApp media download + Google Speech ----
-const speechClient = new speech.SpeechClient();
-
-async function waGetMediaInfo(mediaId) {
-  const url = `${WA_BASE}/${mediaId}`;
-  const { data } = await axios.get(url, { headers: { Authorization: `Bearer ${WA_TOKEN}` } });
-  // data: { id, mime_type, sha256, file_size, url }
-  return data;
-}
-async function waDownloadMedia(mediaUrl) {
-  const resp = await axios.get(mediaUrl, {
-    responseType: 'arraybuffer',
-    headers: { Authorization: `Bearer ${WA_TOKEN}` }
-  });
-  return { buffer: Buffer.from(resp.data), mime: resp.headers['content-type'] || 'application/octet-stream' };
-}
-function guessEncoding(mime) {
-  const m = (mime || '').toLowerCase();
-  if (m.includes('ogg')) return 'OGG_OPUS';
-  if (m.includes('mpeg') || m.includes('mp3')) return 'MP3';
-  if (m.includes('wav')) return 'LINEAR16';
-  if (m.includes('amr')) return 'AMR';
-  if (m.includes('3gpp')) return 'AMR_WB';
-  return 'OGG_OPUS';
-}
-async function transcribeBuffer(buf, mime) {
-  const encoding = guessEncoding(mime);
-  const audio = { content: buf.toString('base64') };
-  const config = {
-    languageCode: 'pt-BR',
-    encoding,
-    enableAutomaticPunctuation: true,
-    model: 'default'
-  };
-  const request = { audio, config };
-  const [response] = await speechClient.recognize(request);
-  const transcription = response.results?.map(r => r.alternatives?.[0]?.transcript).filter(Boolean).join(' ') || '';
-  return transcription.trim();
-}
 
 // Verify endpoint (WhatsApp)
-app.get('/wa/webhook', (req, res) => {
-  const { ['hub.mode']: mode, ['hub.verify_token']: token, ['hub.challenge']: challenge } =
-    req.query;
+app.get('/wa/webhook', (req,res) => {
+  const { ['hub.mode']:mode, ['hub.verify_token']:token, ['hub.challenge']:challenge } = req.query;
   if (mode === 'subscribe' && token === WA_VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
@@ -553,96 +444,93 @@ app.post('/wa/webhook', async (req, res) => {
 
     for (const msg of messages) {
       const from = msg.from;
-      const profileName = contacts?.[0]?.profile?.name;
-      let userText = null;
-      const memoryKey = `lead:${from}`;
+      const profileName = contacts?.[0]?.profile?.name || '';
+      let extraParams = { nome: profileName, telefone: from };
 
-      // Load memory
-      const mem = (await memGet(memoryKey)) || {};
-      const extraParams = { ...mem, nome: profileName || mem.nome, telefone: from };
+      // CORREÇÃO PRINCIPAL: Processar seleção de lista corretamente
+      if (msg.type === 'interactive' && msg.interactive?.type === 'list_reply') {
+        const id = msg.interactive.list_reply?.id || '';
+        let vagaId = '';
+        if (id.startsWith('select:')) vagaId = id.split(':')[1]?.trim() || '';
 
-      // Message types
-      if (msg.type === 'text') {
-        userText = msg.text?.body?.trim();
-      } else if (msg.type === 'interactive') {
-        if (msg.interactive.type === 'button_reply') {
-          const id = msg.interactive.button_reply?.id;
-          const parsed = parseButtonId(id);
-          if (parsed.action === 'next') userText = 'próxima';
-          else if (parsed.action === 'select') { userText = `quero ${parsed.vaga_id}`; extraParams.vaga_id = parsed.vaga_id; }
-          else userText = parsed.action;
-        } else if (msg.interactive.type === 'list_reply') {
-          const id = msg.interactive.list_reply?.id;
-          const parsed = parseButtonId(id);
-          if (parsed.action === 'select') { userText = `quero ${parsed.vaga_id}`; extraParams.vaga_id = parsed.vaga_id; }
-          else userText = 'próxima';
-        }
-      } else if (msg.type === 'audio' && msg.audio?.id) {
-        try {
-          const info = await waGetMediaInfo(msg.audio.id);
-          const { buffer, mime } = await waDownloadMedia(info.url);
-          const transcript = await transcribeBuffer(buffer, info.mime_type || mime);
-          if (transcript) {
-            userText = transcript;
-            extraParams.audio_transcript = transcript;
-          } else {
-            await waSendText(from, 'Não consegui entender seu áudio. Pode digitar em texto, por favor?');
-            continue;
+        console.log('=== LISTA SELECIONADA ===');
+        console.log('ID selecionado:', id);
+        console.log('Vaga ID extraído:', vagaId);
+        console.log('From:', from);
+
+        if (vagaId) {
+          // SOLUÇÃO: Disparar evento específico para seleção de vaga
+          const resp = await cxDetectEvent(from, 'vaga_selecionada', { 
+            ...extraParams,
+            vaga_id: vagaId
+          });
+          
+          console.log('=== RESPOSTA DO CX PARA SELEÇÃO ===');
+          console.log('Response:', JSON.stringify(resp.queryResult, null, 2));
+          
+          const outputs = resp.queryResult?.responseMessages || [];
+
+          for (const m of outputs) {
+            if (isWaListPayload(m)) {
+              const decoded = decodePayload(m);
+              await waSendList(from, decoded);
+              await sleep(200);
+              continue;
+            }
+            if (m.text && Array.isArray(m.text.text)) {
+              for (const line of m.text.text) if (line && line.trim()) { 
+                await waSendText(from, line); 
+                await sleep(200); 
+              }
+              continue;
+            }
           }
-        } catch (err) {
-          console.error('STT error:', err?.response?.data || err);
-          await waSendText(from, 'Tive um problema para ouvir seu áudio. Pode enviar em texto?');
-          continue;
+        } else {
+          await waSendText(from, 'Não foi possível identificar a vaga selecionada. Tente novamente.');
         }
-      } else {
-        userText = '[anexo recebido]';
+        continue;
       }
 
-      // Dialogflow CX
+      // Botões (se existirem): mapear para eventos também
+      if (msg.type === 'interactive' && msg.interactive?.type === 'button_reply') {
+        const id = msg.interactive.button_reply?.id || '';
+        if (id === 'next') {
+          const resp = await cxDetectEvent(from, 'menu_next', { ...extraParams, menu_action:'next' });
+          const outputs = resp.queryResult?.responseMessages || [];
+          for (const m of outputs) {
+            if (isWaListPayload(m)) { await waSendList(from, decodePayload(m)); await sleep(200); continue; }
+            if (m.text?.text) { for (const line of m.text.text) if (line?.trim()) { await waSendText(from, line); await sleep(200); } }
+          }
+          continue;
+        }
+      }
+
+      // Texto comum → Dialogflow (saudação, respostas etc.)
+      let userText = (msg.type === 'text') ? (msg.text?.body?.trim() || '') : '[anexo]';
       const cxResp = await cxDetectText(from, userText, extraParams);
       const outputs = cxResp.queryResult?.responseMessages || [];
 
-      // Update memory with parameters returned by CX (if any)
-      try {
-        const returnedParams = cxResp.queryResult?.parameters
-          ? require('pb-util').struct.decode(cxResp.queryResult.parameters)
-          : {};
-        const mergeFields = ['nome','telefone','cidade','vagas_abertas','moto_ok','cnh_ok','android_ok','q1','q2','q3','q4','q5','perfil_aprovado','perfil_nota','perfil_resumo','vaga_id','vaga_farmacia','vaga_turno','vaga_taxa','protocolo'];
-        const patch = {};
-        for (const k of mergeFields) if (returnedParams[k] !== undefined) patch[k] = returnedParams[k];
-        if (Object.keys(patch).length) await memMerge(memoryKey, patch);
-      } catch (e) {
-        console.error('Memory merge error:', e?.response?.data || e);
-      }
-
-      // Send messages to WhatsApp
       for (const m of outputs) {
-        if (isChoicesPayload(m)) {
+        if (isWaListPayload(m)) {
           const decoded = decodePayload(m);
-          await waSendButtons(from, 'Escolha uma opção:', buttonsFromChoices(decoded.choices || []));
+          await waSendList(from, decoded);
+          await sleep(200);
           continue;
         }
         if (m.text && Array.isArray(m.text.text)) {
-          for (const raw of m.text.text) {
-            const line = (raw || '').trim();
-            if (!line) continue;
-            await waSendBurst(from, line, 450);
-          }
+          for (const line of m.text.text) if (line && line.trim()) { await waSendText(from, line); await sleep(200); }
           continue;
         }
-        // fallback
-        await waSendText(from, '[mensagem recebida]');
+        // fallback silencioso
       }
     }
     res.sendStatus(200);
   } catch (e) {
-    console.error(e?.response?.data || e);
+    console.error('WhatsApp webhook error:', e?.response?.data || e);
     res.sendStatus(200);
   }
 });
 
 app.listen(PORT, () =>
-  console.log(
-    `Kelly combined on :${PORT} (/cx, /wa/webhook) — CX endpoint: ${CX_LOCATION}-dialogflow.googleapis.com`
-  )
+  console.log(`Kelly combined on :${PORT} (/cx, /wa/webhook) – CX endpoint: ${CX_LOCATION}-dialogflow.googleapis.com`)
 );
